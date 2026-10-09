@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # 1. API Principal (O código que vamos escrever)
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/nurseask
+      - QDRANT_URL=http://qdrant:6333
+      - ELASTIC_URL=http://elasticsearch:9200
+      - NEO4J_URI=bolt://neo4j:7687
+      - REDIS_URL=redis://redis:6379/0
+      - LANGFUSE_HOST=http://langfuse-server:3000
+    depends_on:
+      - postgres
+      - qdrant
+      - elasticsearch
+      - neo4j
+
+  # 2. Vector DB (Qdrant)
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # 3. Busca Híbrida/Léxica (Elasticsearch)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+
+  # 4. Graph DB (Neo4j para GraphRAG)
+  neo4j:
+    image: neo4j:5.19.0
+    environment:
+      - NEO4J_AUTH=neo4j/nurseask_secret
+    ports:
+      - "7474:7474" # Browser Interface
+      - "7687:7687" # Driver Protocol
+    volumes:
+      - neo4j_data:/data
+
+  # 5. Banco Relacional (Usuários e Histórico)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nurseask
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  # 6. Observabilidade & Prompt CMS (Langfuse)
+  langfuse-server:
+    image: langfuse/langfuse:2
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/nurseask
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXTAUTH_SECRET=super_secret_key
+      - SALT=super_secret_salt
+
+  # 7. Checkpointer e Cache de Sessões
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  qdrant_data:
+  es_data:
+  neo4j_data:
+  pg_data:

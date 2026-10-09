@@ -218,3 +218,39 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Ambientes virtuais e compilados
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Configurações locais (Segurança)
+.env
+.env.*
+
+# Logs e IDEs
+*.log
+.vscode/
+.idea/
+
+# Dados temporários dos containers
+docker_data/
+
+# Ambientes Virtuais
+.venv/
+venv/
+env/
+
+# Variáveis de Ambiente (Segurança)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/

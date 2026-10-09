@@ -1,0 +1,25 @@
+# Core da API
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+
+# LangGraph e LangChain Core
+langgraph
+langchain-core
+langchain-openai  # Ou langchain-anthropic
+
+# Conectores e Infra
+qdrant-client
+elasticsearch[async]
+neo4j
+redis
+asyncpg
+sqlalchemy
+
+# Observabilidade
+langfuse
+
+# Segurança (Anonimização)
+presidio-analyzer
+presidio-anonymizer
