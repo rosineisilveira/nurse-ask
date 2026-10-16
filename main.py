@@ -1,5 +1,9 @@
 import json
+import asyncio
 from fastapi import FastAPI
+from fastapi import Request
+from app.application.rag_workflow.graph import nurseask_engine as rag_app
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -82,16 +86,58 @@ async def stream_langgraph_response(question: str, session_id: str) -> AsyncGene
 
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': f'Erro interno: {str(e)}'})}\n\n"
+        
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("frontend/index.html")
 
 
 @app.post("/api/v1/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """
-    Endpoint principal que recebe a requisição e devolve o fluxo (stream).
-    """
-    return StreamingResponse(
-        stream_langgraph_response(question=request.question, session_id=request.session_id),
-        media_type="text/event-stream"
-    )
+async def chat_endpoint(request: Request):
+    data = await request.json()
+    question = data.get("question", "")
 
-#uvicorn main:app --reload
+    async def sse_generator():
+        initial_state = {"question": question}
+        try:
+            # O version="v2" é obrigatório no LangGraph para o streaming funcionar
+            # async for event in nurseask_engine.astream_events(initial_state, version="v2"):
+            #     kind = event["event"]
+                
+            #     # 1. Envia status do Grafo
+            #     if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
+            #          yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando: {event.get('name')}'})}\n\n"
+                
+            #     # 2. Envia os tokens do Ollama
+            #     elif kind == "on_chat_model_stream":
+            #         chunk = event["data"]["chunk"].content
+            #         if chunk:
+            #             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+            
+            # # 3. Encerra a conexão
+            # yield "data: [DONE]\n\n"
+            async for event in nurseask_engine.astream_events(initial_state, version="v2"):
+                kind = event["event"]
+                
+                if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
+                    yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando: {event.get('name')}'})}\n\n"
+                
+                elif kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"].content
+                    
+                    # O SEGREDO 1: Só envia se o chunk for uma string válida E não estiver vazio
+                    if isinstance(chunk, str) and chunk != "":
+                        yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+
+                        # O FREIO ARTIFICIAL (Só para testes!)
+                        await asyncio.sleep(0.5)
+
+            # O SEGREDO 2: O encerramento no formato exato que o JS espera
+            yield "data: {\"type\": \"done\"}\n\n"
+            
+        except Exception as e:
+            print(f"[ERRO SSE] {e}")
+            yield f"data: {json.dumps({'type': 'token', 'content': 'Erro interno.'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(sse_generator(), media_type="text/event-stream")

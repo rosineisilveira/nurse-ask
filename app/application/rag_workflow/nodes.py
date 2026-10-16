@@ -1,63 +1,140 @@
-from app.application.rag_workflow.state import RAGState
-from app.infrastructure.ai_clients.jev_client import JevClient
+import asyncio
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from langchain_ollama import ChatOllama
+from langchain_core.runnables import RunnableConfig
 
-jev_client = JevClient()
+load_dotenv()
 
-async def router_node(state: RAGState) -> dict:
-    """
-    Analyzes the user's question using Jev AI and determines the workflow path.
-    """
+# Configuração Qdrant (HuggingFace)
+qdrant_client = QdrantClient(url="http://localhost:6333")
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+qdrant_store = QdrantVectorStore(
+    client=qdrant_client,
+    collection_name="clinical_guidelines_hf",
+    embedding=embeddings,
+)
+
+# Configuração OpenAI (Gerador)
+# llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0, streaming=True)
+
+llm = ChatOllama(model="llama3.1", temperature=0, streaming=True)
+
+async def retriever_node(state: dict) -> dict:
+    """Busca o protocolo com diagnósticos detalhados."""
     question = state.get("question", "")
     
-    prompt = f"Classify the intent of the following healthcare user query: {question}"
+    print("\n" + "="*50)
+    print("[DEBUG] Iniciando diagnóstico do Retriever...")
+    print("="*50)
     
-    # Execute the deterministic choice primitive
-    response = await jev_client.choice(
-        input_text=prompt,
-        options=["medical_rag", "math_calculator", "chitchat"]
-    )
+    # TESTE 1: A conexão com o Docker do Qdrant está de fato ativa?
+    print("[DEBUG] 1. Testando conexão com o Qdrant (Docker na porta 6333)...")
+    try:
+        # Força um timeout rápido de 3 segundos para não travar para sempre
+        from qdrant_client.http import exceptions
+        info = await asyncio.to_thread(qdrant_client.get_collections)
+        print(f"[✅ OK] Qdrant conectado! Coleções encontradas: {[c.name for c in info.collections]}")
+    except Exception as e:
+        print(f"[❌ ERRO] Não foi possível conectar ao Qdrant: {e}")
+        print("[DICA] O seu Docker do Qdrant está rodando? Use 'docker ps' no terminal.")
+        return {"documents": []}
+
+    # TESTE 2: O modelo da Huggingface está travando para gerar o vetor?
+    print("[DEBUG] 2. Testando modelo de Embeddings (HuggingFace)...")
+    try:
+        # Testa gerar o vetor de uma palavra simples
+        print("[DEBUG] Tentando vetorizar a palavra 'teste'...")
+        vetor = await asyncio.to_thread(embeddings.embed_query, "teste")
+        print(f"[✅ OK] Embeddings funcionando! Tamanho do vetor: {len(vetor)}")
+    except Exception as e:
+        print(f"[❌ ERRO] O modelo HuggingFace travou ou falhou: {e}")
+        print("[DICA] Isso geralmente é problema de SSL/rede bloqueada ou falta de memória.")
+        return {"documents": []}
+
+    # TESTE 3: A busca real
+    print("[DEBUG] 3. Tentando a busca real no Qdrant...")
+    try:
+        # Executa a busca com tratamento
+        results = await asyncio.to_thread(
+            qdrant_store.similarity_search, question, k=1
+        )
+        print(f"[✅ OK] Busca finalizada com sucesso! Achou {len(results)} documentos.")
+        
+        documents = [
+            {"source": res.metadata.get("source", "Desconhecida"), "content": res.page_content}
+            for res in results
+        ]
+        return {"documents": documents}
+        
+    except Exception as e:
+        print(f"[❌ ERRO] A busca final falhou: {e}")
+        return {"documents": []}
+
+async def generator_node(state: dict, config: RunnableConfig) -> dict:
+    question = state.get("question", "")
+    documents = state.get("documents", [])
+
+    print("\n" + "="*50)
+    print(f"[DEBUG GERADOR] Quantos documentos chegaram aqui? {len(documents)}")
+    if not documents:
+        print("[DEBUG GERADOR] ⚠️ ALERTA: A IA está cega! A lista 'documents' está vazia.")
     
-    return {"intent": response.selected_option}
-
-
-async def hybrid_retriever_node(state: RAGState) -> dict:
-    """
-    Retrieves medical guidelines using Vector (Qdrant) and Lexical (Elasticsearch) search.
-    Applies Cohere Rerank. (Currently mocked)
-    """
-    # MOCK (Dados simulados para testar o fluxo antes de ligar o Qdrant real)
-    mock_docs = [
-        {
-            "source": "protocolo_sepse_2024.pdf", 
-            "content": "Administrar antibiótico de amplo espectro na primeira hora."
-        }
-    ]
-    return {"documents": mock_docs}
-
-
-async def generator_node(state: RAGState) -> dict:
-    """
-    Generates the final response anchored strictly to the retrieved context.
-    """
-    # MOCK (Simulação do LLM escrevendo a resposta)
-    mock_answer = "Com base no protocolo de sepse, deve-se administrar antibiótico na primeira hora [1]."
-    return {"answer": mock_answer}
-
-
-async def critic_node(state: RAGState) -> dict:
-    """
-    Uses Jev AI (Noul primitive) to evaluate if the generated response hallucinates.
-    """
-    answer = state.get("answer", "")
+    context_text = "\n".join([doc["content"] for doc in documents]) if documents else "Nenhuma diretriz encontrada."
     
-    # Avalia alucinação. Retorna True (Sim, alucinou) ou False (Não, está seguro)
-    response = await jev_client.noul(input_text=f"Evaluating response for hallucinations: {answer}")
+    prompt = f"""Você é o NurseAsk, um assistente especializado para estudantes de enfermagem.
+    Você deve responder à pergunta do usuário baseando-se EXCLUSIVAMENTE nas DIRETRIZES CLÍNICAS fornecidas abaixo.
+    Se a resposta não estiver nas diretrizes, diga 'Não encontrei essa informação no protocolo atual'.
+    NÃO invente informações. NÃO traga conhecimento externo.
+
+    Contexto clínico: {context_text}
     
-    return {"is_hallucinating": response.boolean_result}
+    Pergunta do usuário: {question}
+    
+    Responda de forma clara e baseada estritamente no contexto."""
+
+    print(f"[DEBUG GERADOR] Prompt final enviado para IA (primeiros 200 chars):\n{prompt[:200]}...")
+    print("="*50 + "\n")
+
+    try:
+        # O SEGREDO ESTÁ AQUI: Passar o 'config' avisa o LangGraph para transmitir as palavras!
+        response = await llm.ainvoke(prompt, config)
+        return {"generation": response.content}
+    except Exception as e:
+        print(f"[ERRO NO GERADOR] Falha de comunicação: {e}")
+        return {"generation": "Erro ao comunicar com o Ollama local."}
+    
+# --- Funções de Roteamento (Esqueleto para o Graph funcionar) ---
+
+# async def router_node(state: dict) -> dict:
+#     """Determina o tipo de pergunta do usuário."""
+#     # Por enquanto, assumimos que tudo é pergunta médica (triage)
+#     return {"intent": "medical_rag"}
 
 
-async def guardrail_node(state: RAGState) -> dict:
-    """
-    Fallback node to block non-medical conversations.
-    """
-    return {"answer": "Sou um assistente clínico. Por favor, faça perguntas focadas em protocolos ou diretrizes médicas."}
+# async def supervisor_node(state: dict) -> dict:
+#     """Supervisiona se a resposta tem qualidade."""
+#     # Por enquanto, aprova tudo e manda encerrar o fluxo
+#     return {"next_step": "end"}
+
+
+# async def fallback_node(state: dict) -> dict:
+#     """Responde quando não entende a pergunta."""
+#     return {"answer": "Desculpe, só posso responder sobre protocolos clínicos baseados em diretrizes médicas."}
+
+
+# async def critic_node(state: dict) -> dict:
+#     """Avalia a qualidade da resposta gerada antes de enviar."""
+#     # Por enquanto, aprova todas as respostas automaticamente
+#     return {"is_valid": True}
+
+# async def guardrail_node(state: dict) -> dict:
+#     """Verifica se a pergunta ou resposta viola regras de segurança médica."""
+#     # Por enquanto, deixa tudo passar e não altera o estado
+#     return {}
+
