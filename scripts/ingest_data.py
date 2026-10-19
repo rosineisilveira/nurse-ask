@@ -1,42 +1,48 @@
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
-from langchain_core.documents import Document
+import os
+import sys
 
-print("Conectando ao Qdrant no Docker...")
-client = QdrantClient(url="http://localhost:6333")
+print(">>> [DEBUG 1] Script de Ingestão Iniciado <<<")
 
-# Novo nome para não conflitar com os vetores antigos da OpenAI
-collection_name = "clinical_guidelines_hf" 
+# Aponta para a raiz do projeto (para achar a pasta database)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# 1. Troca a OpenAI pelo modelo gratuito Multilíngue (baixa na 1ª vez que rodar)
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from database.elastic_motor import ElasticMotor
 
-# 2. Atenção ao size=384, que é o tamanho exato deste modelo gratuito
-if not client.collection_exists(collection_name):
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-    )
+# ⚠️ COLOQUE O NOME DO SEU PDF QUE ESTÁ NA PASTA DOWNLOADS:
+NOME_DO_PDF = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf" 
 
-vector_store = QdrantVectorStore(
-    client=client,
-    collection_name=collection_name,
-    embedding=embeddings,
-)
+# Descobre o caminho automático da sua pasta Downloads
+PASTA_DOWNLOADS = os.path.join(os.path.expanduser('~'), 'Downloads')
+ARQUIVO_PDF = os.path.join(PASTA_DOWNLOADS, NOME_DO_PDF)
 
-docs = [
-    Document(
-        page_content="Paciente com suspeita de infarto agudo do miocárdio (IAM) deve receber AAS 300mg mastigado imediatamente para efeito antiplaquetário, salvo contraindicações.",
-        metadata={"source": "Diretriz IAM 2024"}
-    ),
-    Document(
-        page_content="No choque anafilático, a intervenção de primeira linha e salva-vidas é a injeção intramuscular de Epinefrina (Adrenalina) no vasto lateral da coxa. Não atrase a administração.",
-        metadata={"source": "Protocolo Anafilaxia 2023"}
-    )
-]
+def ingerir_documento():
+    print(f"\n📖 [PASSO 1] Lendo o arquivo em:\n{ARQUIVO_PDF}")
+    loader = PyMuPDFLoader(ARQUIVO_PDF)
+    documentos_originais = loader.load()
+    print(f"✅ O PDF tem {len(documentos_originais)} páginas.")
 
-print("Gerando vetores locais e salvando no Qdrant...")
-vector_store.add_documents(docs)
-print("✅ Dados inseridos com sucesso sem custo algum!")
+    print("\n✂️ [PASSO 2] Fatiando os documentos...")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    documentos_fatiados = text_splitter.split_documents(documentos_originais)
+    print(f"✅ Fatiado em {len(documentos_fatiados)} blocos de texto.")
+
+    print("\n🚀 [PASSO 3] Conectando ao Elasticsearch...")
+    db = ElasticMotor() 
+    
+    sucesso = db.save_documents(documentos_fatiados)
+    if sucesso:
+        print("\n🎉 Tudo salvo! Fazendo teste rápido de busca...")
+        resultados = db.similarity_search("tratamento", top_k=1)
+        if resultados:
+            print(f"✅ SUCESSO! A IA vai ler isso: {resultados[0].page_content[:150]}...")
+        else:
+            print("⚠️ A busca não encontrou a palavra 'tratamento', mas o banco conectou.")
+
+if __name__ == "__main__":
+    print(f">>> [DEBUG 2] Buscando PDF na pasta Downloads... <<<")
+    if not os.path.exists(ARQUIVO_PDF):
+        print(f"❌ ERRO CRÍTICO: Não encontrei o PDF no caminho:\n{ARQUIVO_PDF}")
+    else:
+        ingerir_documento()

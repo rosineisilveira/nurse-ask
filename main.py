@@ -100,22 +100,6 @@ async def chat_endpoint(request: Request):
     async def sse_generator():
         initial_state = {"question": question}
         try:
-            # O version="v2" é obrigatório no LangGraph para o streaming funcionar
-            # async for event in nurseask_engine.astream_events(initial_state, version="v2"):
-            #     kind = event["event"]
-                
-            #     # 1. Envia status do Grafo
-            #     if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
-            #          yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando: {event.get('name')}'})}\n\n"
-                
-            #     # 2. Envia os tokens do Ollama
-            #     elif kind == "on_chat_model_stream":
-            #         chunk = event["data"]["chunk"].content
-            #         if chunk:
-            #             yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-            
-            # # 3. Encerra a conexão
-            # yield "data: [DONE]\n\n"
             async for event in nurseask_engine.astream_events(initial_state, version="v2"):
                 kind = event["event"]
                 
