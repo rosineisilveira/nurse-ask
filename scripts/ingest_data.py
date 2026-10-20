@@ -1,14 +1,13 @@
 import os
 import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from langchain_docling.loader import DoclingLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from database.elastic_motor import ElasticMotor
 
 print(">>> [DEBUG 1] Script de Ingestão Iniciado <<<")
 
-# Aponta para a raiz do projeto (para achar a pasta database)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from database.elastic_motor import ElasticMotor
 
 # ⚠️ COLOQUE O NOME DO SEU PDF QUE ESTÁ NA PASTA DOWNLOADS:
 NOME_DO_PDF = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf" 
@@ -19,8 +18,9 @@ ARQUIVO_PDF = os.path.join(PASTA_DOWNLOADS, NOME_DO_PDF)
 
 def ingerir_documento():
     print(f"\n📖 [PASSO 1] Lendo o arquivo em:\n{ARQUIVO_PDF}")
-    loader = PyMuPDFLoader(ARQUIVO_PDF)
+    loader = DoclingLoader(file_path=ARQUIVO_PDF)
     documentos_originais = loader.load()
+    print(f"✅ O PDF tem {len(documentos_originais)} documentos extraídos (estruturados).")
     print(f"✅ O PDF tem {len(documentos_originais)} páginas.")
 
     print("\n✂️ [PASSO 2] Fatiando os documentos...")
