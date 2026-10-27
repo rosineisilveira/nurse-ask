@@ -9,3 +9,5 @@ class RAGState(TypedDict):
     documents: List[Dict[str, Any]]
     answer: str
     is_hallucinating: bool
+    context_valid: bool
+    retry_count: int

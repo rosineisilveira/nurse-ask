@@ -98,26 +98,31 @@ async def chat_endpoint(request: Request):
     question = data.get("question", "")
 
     async def sse_generator():
-        initial_state = {"question": question}
+        initial_state = {"question": question,
+                         "documents": [],
+                         "context_valid": False,
+                         "retry_count": 0}
+
+        # config = {"configurable": {"thread_id": request.session_id}}
         try:
             async for event in nurseask_engine.astream_events(initial_state, version="v2"):
                 kind = event["event"]
+                # Identifica exatamente qual nó do LangGraph disparou o evento
+                node_name = event.get("metadata", {}).get("langgraph_node", "")
                 
+                # 1. NOTIFICAÇÕES DE STATUS (Mostra o progresso sem poluir a resposta do chat)
                 if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
-                    yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando: {event.get('name')}'})}\n\n"
+                    chain_name = event.get("name", "")
+                    # Filtra apenas para os nomes dos seus nós do grafo
+                    if chain_name in ["retriever", "evaluator", "rewrite", "generate"]:
+                        yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando etapa: {chain_name}'})}\n\n"
                 
-                elif kind == "on_chat_model_stream":
+                # 2. O FILTRO DEFINITIVO: Só envia tokens para a tela se o nó for o 'generate'
+                elif kind == "on_chat_model_stream" and node_name == "generate":
                     chunk = event["data"]["chunk"].content
                     
-                    # O SEGREDO 1: Só envia se o chunk for uma string válida E não estiver vazio
                     if isinstance(chunk, str) and chunk != "":
                         yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-
-                        # O FREIO ARTIFICIAL (Só para testes!)
-                        await asyncio.sleep(0.5)
-
-            # O SEGREDO 2: O encerramento no formato exato que o JS espera
-            yield "data: {\"type\": \"done\"}\n\n"
             
         except Exception as e:
             print(f"[ERRO SSE] {e}")
