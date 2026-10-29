@@ -40,96 +40,65 @@ reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 llm = ChatOllama(model="llama3.1", temperature=0.1, streaming=True, num_predict=1000)
 
 
+
 async def retriever_node(state: dict) -> dict:
-    print(f"🔍 [DEBUG RETRIEVER] retry_count ao entrar no Retriever: {state.get('retry_count')}")
-    """Busca o protocolo com diagnósticos detalhados adaptado para Elasticsearch."""
-    # Captura a pergunta de forma resiliente
     question = state.get("question", "")
-    if not question and "messages" in state and len(state["messages"]) > 0:
-        question = state["messages"][-1].content
-        
-    print("\n" + "="*50)
-    print("[DEBUG] Iniciando diagnóstico do Retriever...")
-    print("="*50)
+    print(f"\n🔎 [NODE] Retriever buscando e reclassificando para: '{question}'")
     
-    # TESTE 1: A conexão com o Docker do Elasticsearch está de fato ativa?
-    print("[DEBUG] 1. Testando conexão com o Elasticsearch (Docker na porta 9200)...")
     try:
-        info = await asyncio.to_thread(db.store.client.info)
-        cluster_name = info.get("cluster_name", "desconhecido")
-        print(f"[✅ OK] Elasticsearch conectado! Cluster: {cluster_name}")
-    except Exception as e:
-        print(f"[❌ ERRO] Não foi possível conectar ao Elasticsearch: {e}")
-        return {"documents": [], "question": question}
-
-    # TESTE 2: O modelo da Huggingface está travando para gerar o vetor?
-    print("[DEBUG] 2. Testando modelo de Embeddings (HuggingFace)...")
-    try:
-        print("[DEBUG] Tentando vetorizar a palavra 'teste'...")
-        vetor = await asyncio.to_thread(db.embeddings.embed_query, "teste")
-        print(f"[✅ OK] Embeddings funcionando! Tamanho do vetor: {len(vetor)}")
-    except Exception as e:
-        print(f"[❌ ERRO] O modelo HuggingFace travou ou falhou: {e}")
-        return {"documents": [], "question": question}
-
-    # TESTE 3: A busca real
-    print(f"[DEBUG] 3. Tentando a busca real para: '{question[:30]}...'")
-    try:
-        # Puxa 10 resultados para a "Rede de Pesca"
-        results = await asyncio.to_thread(db.similarity_search, question, top_k=10)
-        print(f"[✅ OK] Busca finalizada com sucesso! Achou {len(results)} documentos brutos.")
+        # 1. Busca bruta no Elasticsearch (puxa 15 candidatos para dar margem)
+        results = await asyncio.to_thread(db.similarity_search, question, top_k=15)
         
         if not results:
-            print("❌ Nenhum trecho encontrado no banco.")
-            return {"documents": [], "question": question}
+            print("❌ Nenhum resultado encontrado no Elasticsearch.")
+            return {"documents": [], "question": question, "top_score": -99.0}
 
-       
-        print(" Re-classificando e filtrando os melhores trechos (CrossEncoder)...")
-        
-        # Monta as duplas e avalia
+        # 2. Re-classificação com CrossEncoder (calcula precisão semântica)
         pares = [[question, doc.page_content] for doc in results]
         notas = reranker.predict(pares)
         
-        # Ordena pelo melhor
+        # Agrupa documento com sua respectiva nota
         docs_com_notas = list(zip(results, notas))
+        
+        # Ordena do maior score para o menor
         docs_com_notas.sort(key=lambda x: x[1], reverse=True)
         
-        # Seleciona apenas os 3 vencedores
-        results_filtered = [doc for doc, nota in docs_com_notas[:3]]
-        
-        documents = []
-        fontes_debug = []
-        
-        # Formata os 3 documentos filtrados do jeito que o gerador espera
-        for res in results_filtered:
-            source = res.metadata.get("source", "Desconhecida")
-            pagina = res.metadata.get("page", "Desconhecida")
-            titulo = res.metadata.get("title", "Sem título")
+        # 3. Consolidação e Deduplicação dos Blocos Pais / Chunks
+        parent_documents = {}
+        for doc, score in docs_com_notas:
+            # Identificador do pai (se usar Parent-Child) ou o próprio ID do chunk
+            parent_id = doc.metadata.get("parent_id") or doc.metadata.get("id") or hash(doc.page_content)
+            parent_text = doc.metadata.get("parent_content", doc.page_content)
             
-            fontes_debug.append(f"Pág {pagina} ({titulo[:20]}...)")
-            
-            documents.append({
-                "source": source,
-                "page": pagina,
-                "title": titulo,
-                "content": res.page_content
-            })
-            
-        print(f"[DEBUG] Fontes extraídas para a IA (Top 3): {fontes_debug}")
-        print("="*50 + "\n")
+            # Garante que só pegamos a melhor ocorrência de uma mesma tabela/seção
+            if parent_id not in parent_documents:
+                parent_documents[parent_id] = {
+                    "source": doc.metadata.get("source", "Desconhecido"),
+                    "page": doc.metadata.get("page", "N/A"),
+                    "hierarquia": doc.metadata.get("hierarquia", ""),
+                    "content": parent_text,
+                    "score": float(score)
+                }
 
-        # Retorna mantendo a chave 'question' para o próximo nó
-        return {"documents": documents,
-                 "question": question,
-                 }
+        # Seleciona os 3 melhores documentos/tabelas após o re-ranking
+        documents = list(parent_documents.values())[:3]
+        
+        top_score = documents[0]["score"] if documents else -99.0
+        print(f"✅ Re-ranking concluído com sucesso. Melhores trechos selecionados (Top Score: {top_score:.2f})")
+        
+        return {
+            "documents": documents, 
+            "question": question,
+            "top_score": top_score
+        }
         
     except Exception as e:
-        print(f"[❌ ERRO] A busca final falhou: {e}")
-        print("="*50 + "\n")
-        return {"documents": [],
-                 "question": question,
-                 "retry_count": state.get("retry_count", 0)}
+        print(f"❌ Erro no retriever_node: {e}")
+        return {"documents": [], "question": question, "top_score": -99.0}
 
+
+
+    
 
 async def generator_node(state: dict, config: RunnableConfig) -> dict:
     question = state.get("question", "")
@@ -147,20 +116,36 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
         context_text = "Nenhuma diretriz encontrada."
         texto_fontes = "Nenhuma fonte encontrada."
     else:
-       context_text = ""
-    fontes_unicas = []
-    
-    for doc in documents:
-        # Envia o TÍTULO e a PÁGINA para o Llama entender o contexto de onde tirou
-        context_text += f"\n--- FONTE (Pág {doc['page']} | Seção: {doc['title']}) ---\n"
-        context_text += doc["content"] + "\n"
+        context_text = ""
+        fontes_unicas = []
         
-        # Guarda a referência para imprimir no frontend
-        referencia = f"Pág. {doc['page']} - {doc['title']}"
-        if referencia not in fontes_unicas:
-            fontes_unicas.append(referencia)
+        for doc in documents:
+            # Extração segura: funciona para LangChain Document ou dict tradicional
+            if hasattr(doc, "page_content"):
+                content = doc.page_content
+                meta = getattr(doc, "metadata", {})
+                page = meta.get("page", 1)
+                title = meta.get("title") or meta.get("source") or "Sem título"
+            elif isinstance(doc, dict):
+                content = doc.get("content") or doc.get("text") or ""
+                page = doc.get("page", 1)
+                title = doc.get("title") or doc.get("source") or "Sem título"
+            else:
+                content = str(doc)
+                page = 1
+                title = "Sem título"
+
+            # Envia o TÍTULO e a PÁGINA para o Llama entender o contexto de onde tirou
+            context_text += f"\n--- FONTE (Pág {page} | Seção: {title}) ---\n"
+            context_text += content + "\n"
             
-    texto_fontes = " | ".join(fontes_unicas)
+            # Guarda a referência para imprimir no frontend
+            referencia = f"Pág. {page} - {title}"
+            if referencia not in fontes_unicas:
+                fontes_unicas.append(referencia)
+                
+        texto_fontes = " | ".join(fontes_unicas)
+
     prompt = f"""Você é o NurseAsk, um assistente clínico especializado em protocolos de enfermagem.
     Sua missão é responder à pergunta do estudante usando APENAS as informações presentes no CONTEXTO CLÍNICO EXTRAÍDO abaixo.
 
@@ -197,9 +182,6 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
     except Exception as e:
         print(f"[ERRO NO GERADOR] Falha de comunicação: {e}")
         return {"generation": "Erro ao comunicar com o Ollama local."}
-    
-
-from langchain_ollama import ChatOllama
 
 async def evaluator_node(state: dict) -> dict:
     print(f"⚖️ [DEBUG EVALUATOR] retry_count ao entrar no Evaluator: {state.get('retry_count')}")

@@ -4,7 +4,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from langchain_docling.loader import DoclingLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from database.elastic_motor import ElasticMotor
-from database.elastic_motor import ElasticMotor
 from docling.document_converter import DocumentConverter
 from langchain_core.documents import Document 
 

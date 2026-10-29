@@ -12,9 +12,12 @@ load_dotenv()
 class ElasticMotor:
     def __init__(self, index_name="protocolos_enfermagem"):
         self.index_name = index_name
-        self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        self.url = os.getenv("ELASTIC_URL", "http://localhost:9200")
         
+        self.url = os.getenv("ELASTIC_URL", "http://localhost:9200")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-m3",
+            model_kwargs={"device": "cpu"}  # Altere para "cuda" se tiver GPU NVIDIA
+        )
         # Voltamos para a estratégia padrão que funciona em qualquer licença.
         # Nós faremos a lógica híbrida manualmente na função de busca!
         self.store = ElasticsearchStore(
