@@ -1,5 +1,10 @@
 import os
 from elasticsearch import Elasticsearch
+from pypdf import PdfReader
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+pdf_path = BASE_DIR / "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf"
 
 es = Elasticsearch(os.getenv("ELASTIC_URL", "http://localhost:9200"))
 
@@ -20,4 +25,6 @@ for hit in res['hits']['hits']:
     print("\n" + "="*40)
 
 
-    #python scripts/test_page_metadata.py
+
+
+    #python tests/test_page_metadata.py

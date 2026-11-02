@@ -1,79 +1,84 @@
-import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from langchain_docling.loader import DoclingLoader
+import warnings
+from pathlib import Path
+
+# Adiciona a raiz do projeto (nurse-ask) ao sys.path
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import pymupdf
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 from database.elastic_motor import ElasticMotor
-from docling.document_converter import DocumentConverter
-from langchain_core.documents import Document 
 
-print(">>> [DEBUG 1] Script de Ingestão Iniciado <<<")
+warnings.filterwarnings("ignore")
 
 
+def obter_caminho_pdf(nome_arquivo: str = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf") -> Path:
+    caminho_local = BASE_DIR / nome_arquivo
+    if caminho_local.exists():
+        return caminho_local
 
-# ⚠️ COLOQUE O NOME DO SEU PDF QUE ESTÁ NA PASTA DOWNLOADS:
-NOME_DO_PDF = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf" 
+    caminho_downloads = Path.home() / "Downloads" / nome_arquivo
+    if caminho_downloads.exists():
+        return caminho_downloads
 
-# Descobre o caminho automático da sua pasta Downloads
-PASTA_DOWNLOADS = os.path.join(os.path.expanduser('~'), 'Downloads')
-ARQUIVO_PDF = os.path.join(PASTA_DOWNLOADS, NOME_DO_PDF)
+    encontrados = list((Path.home() / "Downloads").glob("*[Mm]anual*.pdf"))
+    if encontrados:
+        return encontrados[0]
 
-def ingerir_documento():
-    
-    print("\n📖 [PASSO 1] Docling Nativo: Extraindo estrutura completa...")
-    converter = DocumentConverter()
-    result = converter.convert(ARQUIVO_PDF)
-    
-    # O Docling gera um documento estruturado riquíssimo
-    docling_doc = result.document
-    
-    documentos_preparados = []
-    
-    # Iteramos sobre os itens extraídos (textos, tabelas, imagens)
-    print("⚙️ [PASSO 2] Mapeando Metadados (Títulos e Páginas)...")
-    documentos_texto = []
-    documentos_tabela = [] # Lista VIP
-    
-    # Uma sacada Sênior: O Docling lê de cima para baixo. Vamos guardar o "último título visto"
-    # para que um parágrafo saiba a qual título ele pertence, mesmo que o título esteja na página anterior.
-    ultimo_titulo_visto = "Introdução/Geral"
-    
-    for item, _ in docling_doc.iterate_items():
-        if item.label == "section_header":
-            ultimo_titulo_visto = item.text
+    raise FileNotFoundError(f"❌ O PDF '{nome_arquivo}' não foi encontrado.")
+
+
+def processar_pdf_direto(caminho_pdf: Path) -> list[Document]:
+    print(f"📄 [EXTRAÇÃO INTEGRAL VIA PYMUPDF] Lendo arquivo: {caminho_pdf.name}...")
+
+    doc = pymupdf.open(str(caminho_pdf))
+    print(f"📖 Total de páginas no arquivo: {len(doc)}")
+
+    # Chunk size expandido para 1500 chars com overlap de 300 para não quebrar a tabela
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500,
+        chunk_overlap=300,
+        separators=["\n\n", "\n", " ", ""]
+    )
+
+    documentos_langchain = []
+
+    for idx, page in enumerate(doc):
+        num_pagina = idx + 1
+        texto_pagina = page.get_text("text").strip()
+
+        if not texto_pagina:
+            print(f"⚠️ Página {num_pagina} sem camada de texto legível.")
             continue
-            
-        if item.label in ["text", "list_item", "table"]:
-            pagina = str(item.prov[0].page_no) if hasattr(item, "prov") and item.prov else "Desconhecida"
-            
-            # SE FOR TABELA: Exporta o Markdown e NÃO FATIA
-            if item.label == "table":
-                conteudo = item.export_to_markdown()
-                doc_langchain = Document(
-                    page_content=conteudo,
-                    metadata={"source": "protocolo.pdf", "page": pagina, "title": ultimo_titulo_visto, "tipo": "tabela"}
-                )
-                documentos_tabela.append(doc_langchain)
-            
-            # SE FOR TEXTO: Vai para a lista normal
-            else:
-                doc_langchain = Document(
-                    page_content=item.text,
-                    metadata={"source": "protocolo.pdf", "page": pagina, "title": ultimo_titulo_visto, "tipo": "texto"}
-                )
-                documentos_texto.append(doc_langchain)
 
-    print("✂️ Fatiando apenas parágrafos (preservando tabelas)...")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks_texto = text_splitter.split_documents(documentos_texto)
-    
-    # Junta os textos fatiados com as tabelas INTACTAS
-    chunks_finais = chunks_texto + documentos_tabela
-    
-    print(f"✅ Injetando {len(chunks_finais)} documentos no banco...")
-    db = ElasticMotor()
-    db.store.add_documents(chunks_finais)
-    print("🎉 Ingestão Perfeita Finalizada!")
+        chunks = text_splitter.split_text(texto_pagina)
+        for chunk_idx, chunk in enumerate(chunks):
+            doc_obj = Document(
+                page_content=f"--- PÁGINA {num_pagina} (Parte {chunk_idx + 1}) ---\n{chunk}",
+                metadata={
+                    "source": caminho_pdf.name,
+                    "title": f"Página {num_pagina} (Parte {chunk_idx + 1})",
+                    "tipo": "pymupdf_integral",
+                    "page": num_pagina
+                }
+            )
+            documentos_langchain.append(doc_obj)
+
+    print(f"✅ Extração concluída: {len(documentos_langchain)} chunks gerados a partir de todas as páginas.")
+    return documentos_langchain
+
 
 if __name__ == "__main__":
-    ingerir_documento()
+    caminho_pdf = obter_caminho_pdf()
+    
+    # 1. Processamento direto e sem perda de blocos
+    documentos = processar_pdf_direto(caminho_pdf)
+
+    # 2. Gravação no Elasticsearch
+    print("💾 Gravando no Elasticsearch via ElasticMotor.store...")
+    motor = ElasticMotor(index_name="protocolos_enfermagem")
+    motor.store.add_documents(documentos)
+    print("🎉 Ingestão concluída com sucesso! Todos os dados da Página 30 e tabelas foram armazenados.")

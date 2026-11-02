@@ -97,9 +97,6 @@ async def retriever_node(state: dict) -> dict:
         return {"documents": [], "question": question, "top_score": -99.0}
 
 
-
-    
-
 async def generator_node(state: dict, config: RunnableConfig) -> dict:
     question = state.get("question", "")
     if not question and "messages" in state and len(state["messages"]) > 0:
