@@ -5,93 +5,85 @@ from dotenv import load_dotenv
 from langchain_core.documents import Document
 from sentence_transformers import CrossEncoder
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
 from langchain_ollama import ChatOllama
 from langchain_core.runnables import RunnableConfig
 from database.elastic_motor import ElasticMotor
 from langchain_core.messages import SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama
-
+from langchain_core.language_models import BaseChatModel
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 print("🔌 [NÓ] Conectando motor do banco ao LangGraph...")
-db = ElasticMotor()
+# db = ElasticMotor()
 
 load_dotenv()
 
-# Configuração Qdrant (HuggingFace)
-qdrant_client = QdrantClient(url="http://localhost:6333")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-
-qdrant_store = QdrantVectorStore(
-    client=qdrant_client,
-    collection_name="clinical_guidelines_hf",
-    embedding=embeddings,
-)
-
-print("🧠 Carregando CrossEncoder (Re-ranker)...")
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 llm = ChatOllama(model="llama3.1", temperature=0.1, streaming=True, num_predict=1000)
 
+motor = ElasticMotor(index_name="protocolos_enfermagem")
+
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
 async def retriever_node(state: dict) -> dict:
-    question = state.get("question", "")
+    question = state.get("standalone_question") or state.get("question", "")
+    # question = state.get("question", "")
     print(f"\n🔎 [NODE] Retriever buscando e reclassificando para: '{question}'")
-    
+
     try:
-        # 1. Busca bruta no Elasticsearch (puxa 15 candidatos para dar margem)
-        results = await asyncio.to_thread(db.similarity_search, question, top_k=15)
-        
+        results = await asyncio.to_thread(
+            motor.similarity_search,
+            question,
+            top_k=40
+        )
+
         if not results:
             print("❌ Nenhum resultado encontrado no Elasticsearch.")
             return {"documents": [], "question": question, "top_score": -99.0}
 
-        # 2. Re-classificação com CrossEncoder (calcula precisão semântica)
+        # 2. RERANKING ASSÍNCRONO: Executa a predição sem bloquear a thread principal (Event Loop)
         pares = [[question, doc.page_content] for doc in results]
-        notas = reranker.predict(pares)
-        
-        # Agrupa documento com sua respectiva nota
+        notas = await asyncio.to_thread(reranker.predict, pares)
+
+        # Agrupa documento com sua respectiva nota e ordena do maior para o menor score
         docs_com_notas = list(zip(results, notas))
-        
-        # Ordena do maior score para o menor
         docs_com_notas.sort(key=lambda x: x[1], reverse=True)
-        
-        # 3. Consolidação e Deduplicação dos Blocos Pais / Chunks
+
         parent_documents = {}
         for doc, score in docs_com_notas:
-            # Identificador do pai (se usar Parent-Child) ou o próprio ID do chunk
             parent_id = doc.metadata.get("parent_id") or doc.metadata.get("id") or hash(doc.page_content)
             parent_text = doc.metadata.get("parent_content", doc.page_content)
-            
-            # Garante que só pegamos a melhor ocorrência de uma mesma tabela/seção
+            pages_spanned = doc.metadata.get("pages_spanned") or str(doc.metadata.get("page", "N/A"))
+
+            # Mantém apenas o bloco Pai com maior nota de similaridade semântica
             if parent_id not in parent_documents:
                 parent_documents[parent_id] = {
                     "source": doc.metadata.get("source", "Desconhecido"),
                     "page": doc.metadata.get("page", "N/A"),
-                    "hierarquia": doc.metadata.get("hierarquia", ""),
+                    "pages_spanned": pages_spanned,
+                    "title": doc.metadata.get("title", ""),
                     "content": parent_text,
                     "score": float(score)
                 }
 
-        # Seleciona os 3 melhores documentos/tabelas após o re-ranking
+        # Seleciona os 3 melhores blocos Pais (com contexto amplo de página/tabela)
         documents = list(parent_documents.values())[:3]
-        
         top_score = documents[0]["score"] if documents else -99.0
-        print(f"✅ Re-ranking concluído com sucesso. Melhores trechos selecionados (Top Score: {top_score:.2f})")
-        
+
+        print(f"✅ Re-ranking concluído. Top {len(documents)} blocos Pais selecionados (Top Score: {top_score:.2f})")
+
         return {
-            "documents": documents, 
+            "documents": documents,
             "question": question,
             "top_score": top_score
         }
-        
+
     except Exception as e:
         print(f"❌ Erro no retriever_node: {e}")
         return {"documents": [], "question": question, "top_score": -99.0}
@@ -210,39 +202,167 @@ async def evaluator_node(state: dict) -> dict:
         return {"context_valid": False}
 
 
-async def rewrite_node(state: dict) -> dict:
-    orig_q = state.get("original_question") or state.get("question", "")
-    curr_q = state.get("question", "")
-    curr_count = state.get("retry_count", 0)
+# async def rewrite_node(state: dict) -> dict:
+#     orig_q = state.get("original_question") or state.get("question", "")
+#     curr_q = state.get("question", "")
+#     curr_count = state.get("retry_count", 0)
     
+#     proxima_tentativa = curr_count + 1
+#     print(f"\n🔄 [NODE] Rewriter Iniciado (Processando Tentativa {proxima_tentativa}/3)...")
+
+#     prompt = f"""Você é um especialista em busca de dados clínicos.
+#     A pergunta original do usuário foi: '{orig_q}'
+#     A busca anterior usou: '{curr_q}' e falhou.
+
+#     Esta é a TENTATIVA DE BUSCA #{proxima_tentativa}.
+#     Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
+#     - Na tentativa 1: use sinônimos médicos ou termos formais.
+#     - Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do protocolo.
+#     - Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes.
+
+#     Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
+
+#     # Temperature 0.4 força variações reais a cada tentativa
+#     llm_rewrite = ChatOllama(model="llama3.1", temperature=0.4)
+#     resposta = await llm_rewrite.ainvoke(prompt)
+#     nova_pergunta = resposta.content.strip()
+
+#     print(f"📝 [REWRITER] Nova busca (#{proxima_tentativa}): '{nova_pergunta}'")
+
+#     # Retorna a nova pergunta, limpa os documentos e INCREMENTA o contador explicitamente
+#     return {
+#         "question": nova_pergunta,
+#         "original_question": orig_q,
+#         "documents": [],
+#         "retry_count": proxima_tentativa
+#     }
+
+async def rewrite_node(state: dict) -> dict:
+    # 1. Recupera a pergunta bruta do usuário e a consulta que acabou de falhar
+    pergunta_usuario = state.get("question", "")
+    consulta_anterior = state.get("standalone_question") or pergunta_usuario
+    curr_count = state.get("retry_count", 0)
+
     proxima_tentativa = curr_count + 1
     print(f"\n🔄 [NODE] Rewriter Iniciado (Processando Tentativa {proxima_tentativa}/3)...")
 
-    prompt = f"""Você é um especialista em busca de dados clínicos.
-    A pergunta original do usuário foi: '{orig_q}'
-    A busca anterior usou: '{curr_q}' e falhou.
+    prompt = f"""Você é um especialista em busca de dados clínicos de enfermagem.
+A pergunta original do usuário é: '{pergunta_usuario}'
+A consulta de busca anterior no Elasticsearch foi: '{consulta_anterior}' e falhou em trazer o contexto ideal.
 
-    Esta é a TENTATIVA DE BUSCA #{proxima_tentativa}.
-    Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
-    - Na tentativa 1: use sinônimos médicos ou termos formais.
-    - Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do protocolo.
-    - Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes.
+Esta é a TENTATIVA DE REESCRITA #{proxima_tentativa}.
+Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
+- Na tentativa 1: use sinônimos médicos, termos formais ou nomenclatura oficial de enfermagem.
+- Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do procedimento/protocolo.
+- Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes acessórios.
 
-    Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
-
-    # Temperature 0.4 força variações reais a cada tentativa
+Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
+    
     llm_rewrite = ChatOllama(model="llama3.1", temperature=0.4)
-    resposta = await llm_rewrite.ainvoke(prompt)
-    nova_pergunta = resposta.content.strip()
+    resposta = await llm_rewrite.ainvoke([SystemMessage(content=prompt)])
+    nova_consulta = resposta.content.strip()
 
-    print(f"📝 [REWRITER] Nova busca (#{proxima_tentativa}): '{nova_pergunta}'")
+    print(f"📝 [REWRITER] Nova consulta de busca (#{proxima_tentativa}): '{nova_consulta}'")
 
-    # Retorna a nova pergunta, limpa os documentos e INCREMENTA o contador explicitamente
+    # 2. Retorna a nova busca em 'standalone_question', reseta os documentos e incrementa o contador.
+    # NOTA: 'question' e 'messages' NÃO são tocados para não poluir o histórico no Redis!
     return {
-        "question": nova_pergunta,
-        "original_question": orig_q,
+        "standalone_question": nova_consulta,
         "documents": [],
         "retry_count": proxima_tentativa
+    }
+
+
+async def condense_question_node(state: dict) -> dict:
+    question = state.get("question", "")
+    summary = state.get("summary", "")
+    messages = state.get("messages", [])
+
+    # Se não houver histórico de conversa ou resumo, mantém a pergunta original
+    if not summary and len(messages) <= 1:
+        print("ℹ️ [NODE] Sem histórico prévio. Pergunta mantida idêntica.")
+        return {"standalone_question": question}
+
+    print("🔄 [NODE] Reformulando pergunta com base no histórico...")
+
+    # Constrói o histórico recente (últimas 4 mensagens)
+    historico_recente = ""
+    for msg in messages[-4:]:
+        role = "Enfermeiro" if isinstance(msg, HumanMessage) else "Assistente"
+        historico_recente += f"{role}: {msg.content}\n"
+
+    prompt_reescrita = f"""Você é um assistente técnico de reescrita para RAG de enfermagem.
+    Sua tarefa é reformular a última pergunta do usuário para que ela se torne totalmente AUTÔNOMA e compreensível sem contexto anterior, preservando todas as siglas médicas, termos técnicos e medicamentos.
+
+    Resumo do Contexto Anterior:
+    {summary if summary else "Nenhum resumo anterior."}
+
+    Histórico Recente:
+    {historico_recente}
+
+    Última pergunta do Usuário: "{question}"
+
+    Regras:
+    1. Retorne APENAS a pergunta reescrita de forma direta, sem saudações ou explicações.
+    2. Se a pergunta já for autônoma (ex: "Qual a dosagem de Paracetamol?"), retorne-a exatamente como está.
+    3. Se a pergunta for anafórica (ex: "Quais os materiais para isso?"), substitua "isso" pelo procedimento mencionado anteriormente.
+
+    Pergunta Autônoma:"""
+    llm_condense = ChatOllama(model="llama3.1", temperature=0)
+    resposta = await llm_condense.ainvoke([SystemMessage(content=prompt_reescrita)])
+    standalone = resposta.content.strip()
+
+    print(f"🎯 Pergunta reformulada para busca: '{standalone}'")
+    return {"standalone_question": standalone}
+
+
+# --- NÓ 2: SUMARIZAÇÃO COM PRESERVAÇÃO CLÍNICA ---
+async def summarize_node(state: dict, max_messages: int = 6) -> dict:
+    messages = state.get("messages", [])
+
+    # Só dispara a sumarização se a conversa ultrapassar o limiar
+    if len(messages) <= max_messages:
+        return {}
+
+    print(f"🧹 [NODE] Limiar de mensagens atingido ({len(messages)}). Gerando resumo...")
+
+    summary_atual = state.get("summary", "")
+
+    # Seleciona as mensagens antigas para condensar (exceto o último turno)
+    mensagens_para_resumir = messages[:-2]
+    mensagens_para_manter = messages[-2:]
+
+    texto_mensagens = ""
+    for msg in mensagens_para_resumir:
+        role = "Enfermeiro" if isinstance(msg, HumanMessage) else "Assistente"
+        texto_mensagens += f"{role}: {msg.content}\n"
+
+    prompt_sumarizacao = f"""Você é um sistema de memória clínica para um assistente de enfermagem.
+    Sua missão é atualizar o resumo da conversa mantendo OBRIGATORIAMENTE todos os detalhes técnicos relevantes.
+
+    Resumo Anterior:
+    {summary_atual if summary_atual else "Início da conversa."}
+
+    Novas Mensagens a Condensar:
+    {texto_mensagens}
+
+    Regras Estritas de Preservação:
+    1. MANTENHA TODOS os nomes de procedimentos (ex: Posição de Sims, DDH), calibres de sondas, dosagens, materiais, vias de administração e sinais vitais citados.
+    2. Descarte saudações, desculpas, agradecimentos e conversas fiadas.
+    3. Escreva um resumo denso, objetivo e em parágrafo único.
+
+    Novo Resumo Clínico:"""
+    llm_sumurize = ChatOllama(model="llama3.1", temperature=0)
+    resposta = await llm_sumurize.ainvoke([SystemMessage(content=prompt_sumarizacao)])
+    novo_resumo = resposta.content.strip()
+
+    # Cria instruções de remoção para apagar mensagens antigas do estado no Redis
+    mensagens_removidas = [RemoveMessage(id=m.id) for m in mensagens_para_resumir if hasattr(m, "id") and m.id]
+
+    print(f"✅ Resumo atualizado ({len(novo_resumo)} chars). Mensagens antigas removidas do Redis.")
+    return {
+        "summary": novo_resumo,
+        "messages": mensagens_removidas
     }
     
 # async def router_node(state: dict) -> dict:

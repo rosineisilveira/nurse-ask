@@ -1,4 +1,5 @@
 import os
+import warnings
 from typing import List
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -9,97 +10,98 @@ from .interfaces import DatabaseInterface
 
 load_dotenv()
 
+warnings.filterwarnings("ignore")
+
+
 class ElasticMotor:
     def __init__(self, index_name="protocolos_enfermagem"):
         self.index_name = index_name
-        
         self.url = os.getenv("ELASTIC_URL", "http://localhost:9200")
+
         self.embeddings = HuggingFaceEmbeddings(
             model_name="BAAI/bge-m3",
             model_kwargs={"device": "cpu"}  # Altere para "cuda" se tiver GPU NVIDIA
         )
-        # Voltamos para a estratégia padrão que funciona em qualquer licença.
-        # Nós faremos a lógica híbrida manualmente na função de busca!
+
         self.store = ElasticsearchStore(
             embedding=self.embeddings,
             index_name=self.index_name,
             es_url=self.url
         )
-        
-    def get_retriever(self, top_k=3):
-        # Transforma o banco em um objeto retriever do Langchain
+
+    def get_retriever(self, top_k=30):
+        """Retorna o retriever padrão do LangChain com pool expandido."""
         return self.store.as_retriever(search_kwargs={"k": top_k})
 
-    def similarity_search(self, query: str, top_k=8):
+    def similarity_search(self, query: str, top_k=40) -> List[Document]:
+        """
+        Busca Híbrida Unificada (BM25 + Vetor Denso) em requisição única.
+        Resgata chunks filhos com metadados do documento Pai.
+        """
         cliente = self.store.client
         resultados_finais = []
         ids_vistos = set()
-        from langchain_core.documents import Document
-
-        def add_resultado(hit):
-            texto = hit.get("_source", {}).get("text", "")
-            metadata = hit.get("_source", {}).get("metadata", {})
-            doc_id = hash(texto)
-            if doc_id not in ids_vistos:
-                resultados_finais.append(Document(page_content=texto, metadata=metadata))
-                ids_vistos.add(doc_id)
 
         try:
-            # -------------------------------------------------------------
-            # BUSCA 1: A CAÇADORA DE TABELAS (Ignora a diluição do BM25)
-            # -------------------------------------------------------------
-            query_tabelas = {
-                "size": 3, # Pega as 3 tabelas mais prováveis
+            # 1. Gera o vetor da pergunta usando o modelo de embedding
+            vector_query = self.embeddings.embed_query(query)
+
+            # 2. Query Híbrida Nativa do Elasticsearch (BM25 + KNN em 1 chamada)
+            search_body = {
+                "size": top_k,
                 "query": {
                     "bool": {
-                        "must": [
-                            {"match": {"metadata.tipo": "tabela"}}
-                        ],
                         "should": [
-                            # Procura a palavra no título (Peso gigante)
-                            {"match": {"metadata.title": {"query": query, "boost": 5.0}}},
-                            # Procura no conteúdo (Sem punição de tamanho longo)
-                            {"match": {"text": query}}
+                            # BM25: Busca por palavras-chave no texto
+                            {
+                                "match": {
+                                    "text": {
+                                        "query": query,
+                                        "boost": 0.4
+                                    }
+                                }
+                            },
+                            # BM25: Destaque para termos encontrados no título da página/seção
+                            {
+                                "match": {
+                                    "metadata.title": {
+                                        "query": query,
+                                        "boost": 1.2
+                                    }
+                                }
+                            }
                         ]
                     }
+                },
+                "knn": {
+                    "field": "vector",
+                    "query_vector": vector_query,
+                    "k": top_k,
+                    "num_candidates": top_k * 2,
+                    "boost": 0.6
                 }
             }
-            res_tabelas = cliente.search(index=self.index_name, body=query_tabelas)
-            for hit in res_tabelas.get("hits", {}).get("hits", []):
-                add_resultado(hit)
 
-            # -------------------------------------------------------------
-            # BUSCA 2: TEXTO EXATO (Léxica para parágrafos curtos e CIDs)
-            # -------------------------------------------------------------
-            query_textos = {
-                "size": 3,
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"match": {"metadata.tipo": "texto"}}
-                        ],
-                        "should": [
-                            {"match": {"text": {"query": query, "fuzziness": "AUTO"}}}
-                        ]
-                    }
-                }
-            }
-            res_textos = cliente.search(index=self.index_name, body=query_textos)
-            for hit in res_textos.get("hits", {}).get("hits", []):
-                add_resultado(hit)
+            resposta = cliente.search(index=self.index_name, body=search_body)
+            hits = resposta.get("hits", {}).get("hits", [])
 
-            # -------------------------------------------------------------
-            # BUSCA 3: VETORIAL (Semântica para contexto geral)
-            # -------------------------------------------------------------
-            docs_vetoriais = self.store.similarity_search(query, k=3)
-            for doc in docs_vetoriais:
-                # Re-empacotando para manter o mesmo padrão da função interna
-                fake_hit = {"_source": {"text": doc.page_content, "metadata": doc.metadata}}
-                add_resultado(fake_hit)
+            for hit in hits:
+                source = hit.get("_source", {})
+                texto = source.get("text", "")
+                metadata = source.get("metadata", {})
 
-            # Retorna os melhores resultados combinados (limitado ao top_k)
+                # Chave de deduplicação usando o parent_id se existir, ou o hash do texto
+                doc_id = metadata.get("parent_id") or hash(texto)
+
+                if doc_id not in ids_vistos:
+                    resultados_finais.append(
+                        Document(page_content=texto, metadata=metadata)
+                    )
+                    ids_vistos.add(doc_id)
+
             return resultados_finais[:top_k]
-            
+
         except Exception as e:
-            print(f"[AVISO] Busca Tripla Híbrida Falhou: {e}")
+            print(f"[AVISO] Busca Híbrida nativa falhou: {e}. Executando fallback vetorial puro...")
             return self.store.similarity_search(query, k=top_k)
+
