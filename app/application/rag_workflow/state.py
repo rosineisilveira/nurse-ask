@@ -21,3 +21,5 @@ class RAGState(TypedDict):
     messages: Annotated[List[AnyMessage], add_messages]
     summary: str
     standalone_question: str
+
+    generation: str  #  Adicione para o LangGraph registrar o retorno
