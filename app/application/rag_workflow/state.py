@@ -8,7 +8,6 @@ class RAGState(TypedDict):
     """
     Represents the state of the LangGraph workflow at any given node.
     """
-    # Seus campos originais mantidos intactos:
     question: str
     intent: str
     documents: List[Dict[str, Any]]
@@ -16,10 +15,11 @@ class RAGState(TypedDict):
     is_hallucinating: bool
     context_valid: bool
     retry_count: int
-
-    # Novos campos para suporte à Memória e Reescrita (RRF/RAG):
+    is_out_of_scope: bool
+    fallback_reason: str
+                        #  campos para suporte à Memória e Reescrita (RRF/RAG):
     messages: Annotated[List[AnyMessage], add_messages]
     summary: str
     standalone_question: str
-
-    generation: str  #  Adicione para o LangGraph registrar o retorno
+                        # para o LangGraph registrar o retornov
+    generation: str  

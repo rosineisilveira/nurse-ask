@@ -1,24 +1,36 @@
 import asyncio
 import os
 import sys
+import re
+from pathlib import Path
 from dotenv import load_dotenv
-from langchain_core.documents import Document
 from sentence_transformers import CrossEncoder
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain_core.runnables import RunnableConfig
 from database.elastic_motor import ElasticMotor
 from langchain_core.messages import SystemMessage
-from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama
 from langchain_core.language_models import BaseChatModel
+from app.application.rag_workflow.state import RAGState
+from nemoguardrails import LLMRails, RailsConfig
+from app.application.rag_workflow.schemas import RouteTarget
+
+CURRENT_DIR = Path(__file__).resolve().parent
+
+# 2. Aponta para a pasta nemo_config DENTRO de rag_workflow
+NEMO_CONFIG_PATH = str(CURRENT_DIR / "nemo_config")
+
+# 3. Trava de segurança para avisar se o arquivo ainda não for achado
+if not os.path.exists(os.path.join(NEMO_CONFIG_PATH, "config.yml")):
+    raise FileNotFoundError(f"🚨 ERRO: Não encontrei o config.yml no caminho: {NEMO_CONFIG_PATH}")
+
+# Inicializa o NeMo Guardrails
+config = RailsConfig.from_path(NEMO_CONFIG_PATH)
+rails = LLMRails(config)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-print("🔌 [NÓ] Conectando motor do banco ao LangGraph...")
-# db = ElasticMotor()
 
 load_dotenv()
 
@@ -26,14 +38,58 @@ embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-
 
 llm = ChatOllama(model="llama3.1", temperature=0.1, streaming=True, num_predict=1000)
 
+print(" Conectando motor do banco ao LangGraph...")
 motor = ElasticMotor(index_name="protocolos_enfermagem")
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
+async def guardrail_router_node(state: RAGState) -> dict:
+    """
+    Nó de triagem usando NeMo Guardrails.
+    Se a pergunta acionar um guardrail (insulto, jailbreak, fora de escopo),
+    ele preenche o fallback e desvia. Caso contrário, envia para a busca.
+    """
+    print("🛡️ [ROUTER NODE] NeMo Guardrails analisando a entrada...")
+    question = state.get("question", "").strip()
+
+    # Passa a pergunta do usuário para o NeMo analisar
+    response = await rails.generate_async(messages=[{"role": "user", "content": question}])
+    nemo_reply = response.get("content", "")
+
+    # O NeMo retorna uma resposta padrão se ativou um "bot refuse" do .co
+    # checar se a resposta não é vazia e contém sinais de bloqueio
+    if "Desculpe, sou o assistente" in nemo_reply or "não posso alterar" in nemo_reply or "Não tenho conhecimento" in nemo_reply:
+        print("🛑 [ROUTER NODE] Requisição barrada pelo Guardrail.")
+        return {
+            "is_out_of_scope": True,
+            "fallback_reason": "bloqueado_por_guardrail",
+            "generation": nemo_reply  # Já aproveitamos a mensagem bonitinha do NeMo
+        }
+
+    print("✅ [ROUTER NODE] Passou pelo Guardrail. Encaminhando para o Retriever.")
+    return {
+        "is_out_of_scope": False
+    }
+
+# Função roteadora condicional (a que vai na add_conditional_edges)
+from app.application.rag_workflow.schemas import RouteTarget
+
+def route_after_guardrail(state: RAGState) -> str:
+    """
+    Avalia se o NeMo marcou a entrada como out-of-scope / jailbreak.
+    """
+    is_out_of_scope = state.get("is_out_of_scope", False)
+    
+    if is_out_of_scope:
+        print("🛑 [ROTA] Redirecionando para o Fallback (Bloqueado).")
+        return RouteTarget.FALLBACK.value
+        
+    print("✅ [ROTA] Entrada segura. Prosseguindo para o fluxo normal.")
+    return RouteTarget.RETRIEVER.value # ou 'condense_question'
 
 async def retriever_node(state: dict) -> dict:
     question = state.get("standalone_question") or state.get("question", "")
-    # question = state.get("question", "")
+    
     print(f"\n🔎 [NODE] Retriever buscando e reclassificando para: '{question}'")
 
     try:
@@ -54,6 +110,8 @@ async def retriever_node(state: dict) -> dict:
         # Agrupa documento com sua respectiva nota e ordena do maior para o menor score
         docs_com_notas = list(zip(results, notas))
         docs_com_notas.sort(key=lambda x: x[1], reverse=True)
+
+        # parent child strategy
 
         parent_documents = {}
         for doc, score in docs_com_notas:
@@ -83,11 +141,10 @@ async def retriever_node(state: dict) -> dict:
             "question": question,
             "top_score": top_score
         }
-
+    
     except Exception as e:
         print(f"❌ Erro no retriever_node: {e}")
         return {"documents": [], "question": question, "top_score": -99.0}
-
 
 async def generator_node(state: dict, config: RunnableConfig) -> dict:
     question = state.get("question", "")
@@ -103,10 +160,10 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
     if not documents:
         print("[DEBUG GERADOR] ⚠️ ALERTA: A IA está cega! A lista 'documents' está vazia.")
         context_text = "Nenhuma diretriz encontrada."
-        texto_fontes = "Nenhuma fonte encontrada."
+        text_sources = "Nenhuma fonte encontrada."
     else:
         context_text = ""
-        fontes_unicas = []
+        unique_sources = []
         
         for doc in documents:
             # Extração segura: funciona para LangChain Document ou dict tradicional
@@ -124,16 +181,16 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
                 page = 1
                 title = "Sem título"
 
-            # Envia o TÍTULO e a PÁGINA para o Llama entender o contexto de onde tirou
+            # TÍTULO e a PÁGINA para o Llama entender o contexto de onde tirou
             context_text += f"\n--- FONTE (Pág {page} | Seção: {title}) ---\n"
             context_text += content + "\n"
             
             # Guarda a referência para imprimir no frontend
-            referencia = f"Pág. {page} - {title}"
-            if referencia not in fontes_unicas:
-                fontes_unicas.append(referencia)
+            reference = f"Pág. {page} - {title}"
+            if ReferenceError not in unique_sources:
+                unique_sources.append(reference)
                 
-        texto_fontes = " | ".join(fontes_unicas)
+        text_sources = " | ".join(unique_sources)
 
     prompt = f"""Você é o NurseAsk, um assistente clínico especializado em protocolos de enfermagem.
     Sua missão é responder à pergunta do estudante usando APENAS as informações presentes no CONTEXTO CLÍNICO EXTRAÍDO abaixo.
@@ -154,7 +211,7 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
     {question}
     
     REGRA OBRIGATÓRIA: Ao final da sua resposta, pule uma linha e escreva EXATAMENTE:
-    "**Fontes utilizadas:** {texto_fontes}"
+    "**Fontes utilizadas:** {text_sources}"
     
     Responda de forma clara e baseada estritamente no contexto."""
 
@@ -165,7 +222,7 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
         # O config avisa o LangGraph para transmitir as palavras (SSE)
         response = await llm.ainvoke(prompt, config)
         
-        # RETORNO CORRIGIDO: Voltamos para o formato que o seu main.py espera!
+        # RETORNO CORRIGIDO: Volta para o formato que o main.py espera
         return {"generation": response.content}
         
     except Exception as e:
@@ -202,41 +259,6 @@ async def evaluator_node(state: dict) -> dict:
         return {"context_valid": False}
 
 
-# async def rewrite_node(state: dict) -> dict:
-#     orig_q = state.get("original_question") or state.get("question", "")
-#     curr_q = state.get("question", "")
-#     curr_count = state.get("retry_count", 0)
-    
-#     proxima_tentativa = curr_count + 1
-#     print(f"\n🔄 [NODE] Rewriter Iniciado (Processando Tentativa {proxima_tentativa}/3)...")
-
-#     prompt = f"""Você é um especialista em busca de dados clínicos.
-#     A pergunta original do usuário foi: '{orig_q}'
-#     A busca anterior usou: '{curr_q}' e falhou.
-
-#     Esta é a TENTATIVA DE BUSCA #{proxima_tentativa}.
-#     Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
-#     - Na tentativa 1: use sinônimos médicos ou termos formais.
-#     - Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do protocolo.
-#     - Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes.
-
-#     Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
-
-#     # Temperature 0.4 força variações reais a cada tentativa
-#     llm_rewrite = ChatOllama(model="llama3.1", temperature=0.4)
-#     resposta = await llm_rewrite.ainvoke(prompt)
-#     nova_pergunta = resposta.content.strip()
-
-#     print(f"📝 [REWRITER] Nova busca (#{proxima_tentativa}): '{nova_pergunta}'")
-
-#     # Retorna a nova pergunta, limpa os documentos e INCREMENTA o contador explicitamente
-#     return {
-#         "question": nova_pergunta,
-#         "original_question": orig_q,
-#         "documents": [],
-#         "retry_count": proxima_tentativa
-#     }
-
 async def rewrite_node(state: dict) -> dict:
     # 1. Recupera a pergunta bruta do usuário e a consulta que acabou de falhar
     pergunta_usuario = state.get("question", "")
@@ -247,16 +269,16 @@ async def rewrite_node(state: dict) -> dict:
     print(f"\n🔄 [NODE] Rewriter Iniciado (Processando Tentativa {proxima_tentativa}/3)...")
 
     prompt = f"""Você é um especialista em busca de dados clínicos de enfermagem.
-A pergunta original do usuário é: '{pergunta_usuario}'
-A consulta de busca anterior no Elasticsearch foi: '{consulta_anterior}' e falhou em trazer o contexto ideal.
+    A pergunta original do usuário é: '{pergunta_usuario}'
+    A consulta de busca anterior no Elasticsearch foi: '{consulta_anterior}' e falhou em trazer o contexto ideal.
 
-Esta é a TENTATIVA DE REESCRITA #{proxima_tentativa}.
-Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
-- Na tentativa 1: use sinônimos médicos, termos formais ou nomenclatura oficial de enfermagem.
-- Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do procedimento/protocolo.
-- Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes acessórios.
+    Esta é a TENTATIVA DE REESCRITA #{proxima_tentativa}.
+    Gere uma nova consulta de busca COMPLETAMENTE DIFERENTE da anterior:
+    - Na tentativa 1: use sinônimos médicos, termos formais ou nomenclatura oficial de enfermagem.
+    - Na tentativa 2: extraia apenas as 2 ou 3 palavras-chave fundamentais do procedimento/protocolo.
+    - Na tentativa 3: use o nome genérico da patologia/procedimento sem detalhes acessórios.
 
-Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
+    Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
     
     llm_rewrite = ChatOllama(model="llama3.1", temperature=0.4)
     resposta = await llm_rewrite.ainvoke([SystemMessage(content=prompt)])
@@ -264,14 +286,13 @@ Retorne APENAS a nova frase de busca, sem aspas e sem explicações."""
 
     print(f"📝 [REWRITER] Nova consulta de busca (#{proxima_tentativa}): '{nova_consulta}'")
 
-    # 2. Retorna a nova busca em 'standalone_question', reseta os documentos e incrementa o contador.
+    # 2. Retorna 'standalone_question', reseta os documentos e incrementa o contador.
     # NOTA: 'question' e 'messages' NÃO são tocados para não poluir o histórico no Redis!
     return {
         "standalone_question": nova_consulta,
         "documents": [],
         "retry_count": proxima_tentativa
     }
-
 
 async def condense_question_node(state: dict) -> dict:
     question = state.get("question", "")
@@ -364,27 +385,26 @@ async def summarize_node(state: dict, max_messages: int = 6) -> dict:
         "summary": novo_resumo,
         "messages": mensagens_removidas
     }
+
+
+async def fallback_node(state: RAGState) -> dict:
+    print("🛟 [FALLBACK NODE] Encerrando com mensagem de segurança.")
     
-# async def router_node(state: dict) -> dict:
-#     """Determina o tipo de pergunta do usuário."""
-#     # Por enquanto, assumimos que tudo é pergunta médica (triage)
-#     return {"intent": "medical_rag"}
-
-
-
-
-# async def fallback_node(state: dict) -> dict:
-#     """Responde quando não entende a pergunta."""
-#     return {"answer": "Desculpe, só posso responder sobre protocolos clínicos baseados em diretrizes médicas."}
+    safe_response = state.get(
+        "generation", 
+        "Desculpe, sou o assistente clínico NurseAsk e não posso processar essa solicitação."
+    )
+    #  apenas a frase limpa vinda do neMo
+    match = re.search(r'"([^"]+)"', safe_response)
+    if match:
+        safe_response = match.group(1) 
+     
+    return {"generation": safe_response}
+    
+    
 
 
 # async def critic_node(state: dict) -> dict:
 #     """Avalia a qualidade da resposta gerada antes de enviar."""
-#     # Por enquanto, aprova todas as respostas automaticamente
 #     return {"is_valid": True}
-
-# async def guardrail_node(state: dict) -> dict:
-#     """Verifica se a pergunta ou resposta viola regras de segurança médica."""
-#     # Por enquanto, deixa tudo passar e não altera o estado
-#     return {}
 

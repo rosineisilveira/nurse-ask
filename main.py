@@ -110,45 +110,6 @@ async def serve_frontend():
     return FileResponse("frontend/index.html")
 
 
-# @app.post("/api/v1/chat/stream")
-# async def chat_endpoint(request: Request):
-#     data = await request.json()
-#     question = data.get("question", "")
-
-#     async def sse_generator():
-#         initial_state = {"question": question,
-#                          "documents": [],
-#                          "context_valid": False,
-#                          "retry_count": 0}
-
-#         # config = {"configurable": {"thread_id": request.session_id}}
-#         try:
-#             async for event in nurseask_engine.astream_events(initial_state, version="v2"):
-#                 kind = event["event"]
-#                 # Identifica exatamente qual nó do LangGraph disparou o evento
-#                 node_name = event.get("metadata", {}).get("langgraph_node", "")
-                
-#                 # 1. NOTIFICAÇÕES DE STATUS (Mostra o progresso sem poluir a resposta do chat)
-#                 if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
-#                     chain_name = event.get("name", "")
-#                     # Filtra apenas para os nomes dos seus nós do grafo
-#                     if chain_name in ["retriever", "evaluator", "rewrite", "generate"]:
-#                         yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando etapa: {chain_name}'})}\n\n"
-                
-#                 # 2. O FILTRO DEFINITIVO: Só envia tokens para a tela se o nó for o 'generate'
-#                 elif kind == "on_chat_model_stream" and node_name == "generate":
-#                     chunk = event["data"]["chunk"].content
-                    
-#                     if isinstance(chunk, str) and chunk != "":
-#                         yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
-            
-#         except Exception as e:
-#             print(f"[ERRO SSE] {e}")
-#             yield f"data: {json.dumps({'type': 'token', 'content': 'Erro interno.'})}\n\n"
-#             yield "data: [DONE]\n\n"
-
-#     return StreamingResponse(sse_generator(), media_type="text/event-stream")
-
 @app.post("/api/v1/chat/stream")
 async def chat_endpoint(request: Request):
     data = await request.json()
@@ -180,7 +141,7 @@ async def chat_endpoint(request: Request):
                 # 1. NOTIFICAÇÕES DE STATUS
                 if kind == "on_chain_start" and not event.get("name", "").startswith("Runnable"):
                     chain_name = event.get("name", "")
-                    if chain_name in ["condense_question", "retriever", "evaluator", "rewrite", "generate", "summarize"]:
+                    if chain_name in ["condense_question", "retriever", "evaluator", "rewrite", "generate", "summarize", "fallback_node"]:
                         yield f"data: {json.dumps({'type': 'status', 'content': f'Iniciando etapa: {chain_name}'})}\n\n"
 
                 # 2. FILTRO DE TOKENS
@@ -189,6 +150,19 @@ async def chat_endpoint(request: Request):
 
                     if isinstance(chunk, str) and chunk != "":
                         yield f"data: {json.dumps({'type': 'token', 'content': chunk})}\n\n"
+                        
+                # 3.CAPTURAR A RESPOSTA FINAL DO FALLBACK
+                # O fallback retorna o payload todo de uma vez no on_chain_end
+                elif kind == "on_chain_end" and node_name in ["fallback", "fallback_node"]:
+                    output = event.get("data", {}).get("output", {})
+                    
+                    if isinstance(output, dict) and "generation" in output:
+                        texto_seguranca = output["generation"]
+                        
+                        # SIMULADOR DE STREAMING: Quebra a frase em palavras e envia uma a uma
+                        for word in texto_seguranca.split():
+                            yield f"data: {json.dumps({'type': 'token', 'content': word + ' '})}\n\n"
+                            await asyncio.sleep(0.03) #tempo para o frontend processar
 
             yield "data: [DONE]\n\n"
 
