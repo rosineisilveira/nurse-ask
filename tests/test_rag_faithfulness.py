@@ -2,14 +2,14 @@ import pytest
 from deepeval import assert_test
 from deepeval.metrics import FaithfulnessMetric
 from deepeval.test_case import LLMTestCase
-
 from tests.ollama_judge import OllamaJudge
+from ollama_judge import OllamaJudge
 from app.application.rag_workflow.graph import nurseask_engine
 
 
 @pytest.mark.asyncio
 async def test_faithfulness():
-    pergunta = "tubos para rotinas laboratoriais?"
+    pergunta = "posiçoes terapeuticas ?"
 
     # 1. Executa o grafo
     config = {"configurable": {"thread_id": "test_faithfulness_session"}}
@@ -55,3 +55,5 @@ async def test_faithfulness():
     )
 
     assert_test(test_case, [faithfulness_metric])
+
+    #pytest tests/test_rag_faithfulness.py

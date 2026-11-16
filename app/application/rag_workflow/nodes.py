@@ -12,23 +12,16 @@ from langchain_core.runnables import RunnableConfig
 from database.elastic_motor import ElasticMotor
 from langchain_core.messages import SystemMessage
 from langchain_ollama import ChatOllama
-from langchain_core.language_models import BaseChatModel
+from langchain_core.prompts import ChatPromptTemplate
 from app.application.rag_workflow.state import RAGState
-from nemoguardrails import LLMRails, RailsConfig
-from app.application.rag_workflow.schemas import RouteTarget
+from langchain_core.prompts import ChatPromptTemplate
+from app.application.rag_workflow.schemas import RouteTarget, GuardrailDecision, EvaluationDecision
+import logging
+# Configuração de Logger para substituir os prints em produção
+logger = logging.getLogger(__name__)
 
 CURRENT_DIR = Path(__file__).resolve().parent
 
-# 2. Aponta para a pasta nemo_config DENTRO de rag_workflow
-NEMO_CONFIG_PATH = str(CURRENT_DIR / "nemo_config")
-
-# 3. Trava de segurança para avisar se o arquivo ainda não for achado
-if not os.path.exists(os.path.join(NEMO_CONFIG_PATH, "config.yml")):
-    raise FileNotFoundError(f"🚨 ERRO: Não encontrei o config.yml no caminho: {NEMO_CONFIG_PATH}")
-
-# Inicializa o NeMo Guardrails
-config = RailsConfig.from_path(NEMO_CONFIG_PATH)
-rails = LLMRails(config)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -38,42 +31,55 @@ embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-
 
 llm = ChatOllama(model="llama3.1", temperature=0.1, streaming=True, num_predict=1000)
 
-print(" Conectando motor do banco ao LangGraph...")
 motor = ElasticMotor(index_name="protocolos_enfermagem")
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 async def guardrail_router_node(state: RAGState) -> dict:
-    """
-    Nó de triagem usando NeMo Guardrails.
-    Se a pergunta acionar um guardrail (insulto, jailbreak, fora de escopo),
-    ele preenche o fallback e desvia. Caso contrário, envia para a busca.
-    """
-    print("🛡️ [ROUTER NODE] NeMo Guardrails analisando a entrada...")
     question = state.get("question", "").strip()
+    
+    logger.info(f"\n🛡️ [NODE] Guardrail acionado para a pergunta: '{question}'")
 
-    # Passa a pergunta do usuário para o NeMo analisar
-    response = await rails.generate_async(messages=[{"role": "user", "content": question}])
-    nemo_reply = response.get("content", "")
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Você é o porteiro do NurseAsk. O app só aceita perguntas sobre saúde, enfermagem e medicina. Responda usando o formato JSON exigido."),
+        ("human", "{question}")
+    ])
 
-    # O NeMo retorna uma resposta padrão se ativou um "bot refuse" do .co
-    # checar se a resposta não é vazia e contém sinais de bloqueio
-    if "Desculpe, sou o assistente" in nemo_reply or "não posso alterar" in nemo_reply or "Não tenho conhecimento" in nemo_reply:
-        print("🛑 [ROUTER NODE] Requisição barrada pelo Guardrail.")
+    try:
+        router_llm = llm.with_structured_output(GuardrailDecision)
+        chain = prompt | router_llm
+        
+        decision = await chain.ainvoke({"question": question})
+
+        if not decision.is_safe:
+            logger.warning("🛑 [NODE] Requisição barrada pelo Guardrail. Fora de escopo clínico.")
+            return {
+                "is_out_of_scope": True,
+                "fallback_reason": "fora_de_escopo",
+                "generation": "Desculpe, sou o assistente clínico NurseAsk e sou focado exclusivamente em protocolos de enfermagem.",
+                "standalone_question": question
+            }
+
+        logger.info("✅ [NODE] Guardrail aprovado. Roteando para o Elasticsearch.")
+        
+        # Garante a variável de busca para que o retriever_node não faça consultas vazias
         return {
-            "is_out_of_scope": True,
-            "fallback_reason": "bloqueado_por_guardrail",
-            "generation": nemo_reply  # Já aproveitamos a mensagem bonitinha do NeMo
+            "is_out_of_scope": False,
+            "standalone_question": question
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ [NODE] Erro crítico no guardrail_router_node: {e}", exc_info=True)
+        
+        # Fail Open: Em caso de falha no modelo, permite seguir o fluxo
+        # e garante a standalone_question para não quebrar o banco de dados.
+        return {
+            "is_out_of_scope": False,
+            "standalone_question": question,
+            "error": str(e)
         }
 
-    print("✅ [ROUTER NODE] Passou pelo Guardrail. Encaminhando para o Retriever.")
-    return {
-        "is_out_of_scope": False
-    }
-
 # Função roteadora condicional (a que vai na add_conditional_edges)
-from app.application.rag_workflow.schemas import RouteTarget
-
 def route_after_guardrail(state: RAGState) -> str:
     """
     Avalia se o NeMo marcou a entrada como out-of-scope / jailbreak.
@@ -90,52 +96,23 @@ def route_after_guardrail(state: RAGState) -> str:
 async def retriever_node(state: dict) -> dict:
     question = state.get("standalone_question") or state.get("question", "")
     
-    print(f"\n🔎 [NODE] Retriever buscando e reclassificando para: '{question}'")
+    logger.info(f"\n🔎 [NODE] Retriever acionado para a pergunta: '{question}'")
 
     try:
-        results = await asyncio.to_thread(
-            motor.similarity_search,
-            question,
-            top_k=40
-        )
+        # 1. Delegação Total: O motor faz a busca híbrida, remonta os pais, aplica o reranker e devolve o Top 3 pronto.
+        # Não usamos mais asyncio.to_thread aqui, pois o método aretrieve_context já é 100% assíncrono (I/O Bound).
+        documents = await motor.aretrieve_context(query=question, top_k_es=40, top_n_final=3)
 
-        if not results:
-            print("❌ Nenhum resultado encontrado no Elasticsearch.")
+        if not documents:
+            logger.warning("❌ [NODE] Nenhum documento retornado pelo Elasticsearch.")
             return {"documents": [], "question": question, "top_score": -99.0}
 
-        # 2. RERANKING ASSÍNCRONO: Executa a predição sem bloquear a thread principal (Event Loop)
-        pares = [[question, doc.page_content] for doc in results]
-        notas = await asyncio.to_thread(reranker.predict, pares)
+        # 2. Extração de Telemetria: Pega a nota do documento melhor ranqueado
+        top_score = documents[0].get("score", -99.0)
 
-        # Agrupa documento com sua respectiva nota e ordena do maior para o menor score
-        docs_com_notas = list(zip(results, notas))
-        docs_com_notas.sort(key=lambda x: x[1], reverse=True)
+        logger.info(f"✅ [NODE] Recuperação concluída. {len(documents)} documentos obtidos (Top Score: {top_score:.2f})")
 
-        # parent child strategy
-
-        parent_documents = {}
-        for doc, score in docs_com_notas:
-            parent_id = doc.metadata.get("parent_id") or doc.metadata.get("id") or hash(doc.page_content)
-            parent_text = doc.metadata.get("parent_content", doc.page_content)
-            pages_spanned = doc.metadata.get("pages_spanned") or str(doc.metadata.get("page", "N/A"))
-
-            # Mantém apenas o bloco Pai com maior nota de similaridade semântica
-            if parent_id not in parent_documents:
-                parent_documents[parent_id] = {
-                    "source": doc.metadata.get("source", "Desconhecido"),
-                    "page": doc.metadata.get("page", "N/A"),
-                    "pages_spanned": pages_spanned,
-                    "title": doc.metadata.get("title", ""),
-                    "content": parent_text,
-                    "score": float(score)
-                }
-
-        # Seleciona os 3 melhores blocos Pais (com contexto amplo de página/tabela)
-        documents = list(parent_documents.values())[:3]
-        top_score = documents[0]["score"] if documents else -99.0
-
-        print(f"✅ Re-ranking concluído. Top {len(documents)} blocos Pais selecionados (Top Score: {top_score:.2f})")
-
+        # 3. Atualização do Estado (RAGState)
         return {
             "documents": documents,
             "question": question,
@@ -143,15 +120,23 @@ async def retriever_node(state: dict) -> dict:
         }
     
     except Exception as e:
-        print(f"❌ Erro no retriever_node: {e}")
-        return {"documents": [], "question": question, "top_score": -99.0}
+        # Substitui o print simples por um log de erro rastreável com stack trace
+        logger.error(f"❌ [NODE] Erro crítico no retriever_node: {e}", exc_info=True)
+        
+        # Opcional: Adicionar a chave "error" no retorno permite que uma aresta condicional (conditional edge)
+        # no LangGraph identifique a falha do banco de dados e tome uma ação amigável.
+        return {
+            "documents": [], 
+            "question": question, 
+            "top_score": -99.0,
+            "error": str(e) 
+        }
 
 async def generator_node(state: dict, config: RunnableConfig) -> dict:
     question = state.get("question", "")
     if not question and "messages" in state and len(state["messages"]) > 0:
         question = state["messages"][-1].content
         
-    # Pega os documentos que o retriever_node acabou de buscar e salvar no state
     documents = state.get("documents", [])
 
     print("\n" + "="*50)
@@ -166,7 +151,7 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
         unique_sources = []
         
         for doc in documents:
-            # Extração segura: funciona para LangChain Document ou dict tradicional
+            # Extração segura e padronizada
             if hasattr(doc, "page_content"):
                 content = doc.page_content
                 meta = getattr(doc, "metadata", {})
@@ -181,13 +166,12 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
                 page = 1
                 title = "Sem título"
 
-            # TÍTULO e a PÁGINA para o Llama entender o contexto de onde tirou
             context_text += f"\n--- FONTE (Pág {page} | Seção: {title}) ---\n"
             context_text += content + "\n"
             
-            # Guarda a referência para imprimir no frontend
+            #  Uso correto da string de referência para unicidade 
             reference = f"Pág. {page} - {title}"
-            if ReferenceError not in unique_sources:
+            if reference not in unique_sources:
                 unique_sources.append(reference)
                 
         text_sources = " | ".join(unique_sources)
@@ -219,10 +203,7 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
     print("="*50 + "\n")
 
     try:
-        # O config avisa o LangGraph para transmitir as palavras (SSE)
         response = await llm.ainvoke(prompt, config)
-        
-        # RETORNO CORRIGIDO: Volta para o formato que o main.py espera
         return {"generation": response.content}
         
     except Exception as e:
@@ -230,35 +211,55 @@ async def generator_node(state: dict, config: RunnableConfig) -> dict:
         return {"generation": "Erro ao comunicar com o Ollama local."}
 
 async def evaluator_node(state: dict) -> dict:
-    print(f"⚖️ [DEBUG EVALUATOR] retry_count ao entrar no Evaluator: {state.get('retry_count')}")
-    print("\n⚖️ [NODE] Evaluator Iniciado...")
-    question = state["question"]
-    documents = state.get("documents", [])
+    question = state.get("standalone_question") or state.get("question", "")
+    docs = state.get("documents", [])
+    
+    logger.info(f"\n⚖️ [NODE] Evaluator acionado para a pergunta: '{question}'")
 
-    if not documents:
-        print("❌ JUIZ: Nenhum documento retornado.")
-        return {"context_valid": False}
+    # 1. Extração à prova de falhas: apenas converte o que veio do banco para string.
+    # Sem "ifs" que barram o texto indevidamente.
+    context_text = "\n\n".join([str(doc) for doc in docs])
+
+    if not docs:
+        logger.warning("⚠️ [NODE] Nenhum documento recebido do Retriever.")
+        return {"is_approved": False, "context_valid": False}
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """Você é um avaliador de relevância de contexto clínico.
+SEJA PERMISSIVO. Se o documento contiver QUALQUER informação útil ou palavra-chave para a pergunta, aprove.
+Responda APENAS usando o formato JSON exigido."""),
+        ("human", "Pergunta: {question}\n\nDocumentos:\n{context}")
+    ])
+
+    try:
+        evaluator_llm = llm.with_structured_output(EvaluationDecision)
+        chain = prompt | evaluator_llm
         
-        
-    context_text = "\n".join([doc.get("content", "") for doc in documents])
-    
-    prompt_juiz = f"""Responda EXATAMENTE com a palavra SIM ou NÃO, sem nenhuma pontuação ou texto adicional.
-    O contexto abaixo possui a resposta para a pergunta?
-    CONTEXTO: {context_text}
-    PERGUNTA: {question}"""
-    
-    llm_juiz = ChatOllama(model="llama3.1", temperature=0.0)
-    resposta = await llm_juiz.ainvoke(prompt_juiz)
-    veredicto = resposta.content.strip().upper()
-    
-    if "SIM" in veredicto:
-        print("✅ JUIZ: Aprovado.")
-        return {"context_valid": True}
-    else:
-        print("❌ JUIZ: Reprovado.")
-        return {"context_valid": False}
+        decision = await chain.ainvoke({
+            "question": question, 
+            "context": context_text
+        })
 
+        is_valid = decision.is_approved
 
+        if not is_valid:
+            logger.warning(f"🛑 [NODE] Contexto reprovado pelo LLM. Motivo: {decision.reason}")
+        else:
+            logger.info("✅ [NODE] Contexto aprovado. Roteando para a geração.")
+
+        # 2. A CORREÇÃO CRÍTICA DO ESTADO:
+        # Retornamos 'context_valid' para garantir que a sua aresta condicional reconheça a aprovação
+        return {
+            "is_approved": is_valid,
+            "context_valid": is_valid  
+        }
+
+    except Exception as e:
+        logger.error(f"❌ [NODE] Erro no evaluator_node: {e}", exc_info=True)
+        # Fail Open absoluto
+        return {"is_approved": True, "context_valid": True}
+
+    
 async def rewrite_node(state: dict) -> dict:
     # 1. Recupera a pergunta bruta do usuário e a consulta que acabou de falhar
     pergunta_usuario = state.get("question", "")
