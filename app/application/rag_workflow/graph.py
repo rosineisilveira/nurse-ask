@@ -8,40 +8,39 @@ from app.application.rag_workflow.schemas import RouteTarget
 
 from app.application.rag_workflow.state import RAGState
 from app.application.rag_workflow.nodes import (
-    condense_question_node,
-    retriever_node,
-    evaluator_node,
     rewrite_node,
-    generator_node,
-    summarize_node,
+    fallback_node,
+    retriever_node,
     guardrail_router_node,
+    generator_node,
     route_after_guardrail,
-    fallback_node
+    condense_question_node,
+    summarize_node,
+    evaluator_node
+    
 )
 
-# 1. Conexão com o Redis Checkpointer
+## 1. Conexão com o Redis Checkpointer
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
 
-
-# 2. Roteador Condicional (Utilizando RAGState e limite de 3 tentativas)
+   
 def decide_to_generate(state: RAGState) -> str:
     valid = state.get("context_valid", False)
     count = state.get("retry_count", 0)
 
     print(f"\n🚦 [ROTEADOR] Contexto Válido: {valid} | Tentativas de reescrita realizadas: {count}/3")
 
-    # Se o contexto é válido OU se já reescrevemos 3 vezes, avança para o gerador
-    if valid or count >= 3:
-        if not valid:
-            print("🛑 [ROTEADOR] Limite de 3 tentativas atingido! Forçando ida para o Gerador.")
-        else:
-            print("✅ [ROTEADOR] Contexto Aprovado! Indo para o Gerador.")
+    if valid:
+        print("✅ [ROTEADOR] Contexto Aprovado! Indo para o Gerador.")
         return "generate"
+
+    if count >= 3:
+        print("🛑 [ROTEADOR] Limite de 3 tentativas atingido! Abstendo via Fallback.")
+        return "fallback"
 
     print("🔄 [ROTEADOR] Contexto Reprovado -> Enviando para o Rewriter.")
     return "rewrite"
-
 
 # 3. Construção do Grafo com RAGState
 builder = StateGraph(RAGState)
@@ -87,6 +86,7 @@ builder.add_conditional_edges(
     {
         "generate": "generate",
         "rewrite": "rewrite",
+        "fallback": "fallback",
     },
 )
 
@@ -99,3 +99,6 @@ builder.add_edge("summarize", END)
 
 # 5. Compilação com Checkpointer Nativo no Redis
 nurseask_engine = builder.compile(checkpointer=checkpointer)
+
+
+
