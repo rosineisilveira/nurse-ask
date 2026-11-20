@@ -24,8 +24,6 @@ Assistente clínico para consulta de protocolos de enfermagem baseado em Agentic
 - **Memória de conversa:** resume interações antigas no Redis (`summarize_node`) para não estourar o limite de tokens.
 - **Observabilidade e testes:** rastreamento com LangSmith e validação automatizada com DeepEval.
 
-## Arquitetura do Grafo (LangGraph)
-
 ```mermaid
 flowchart TD
     Start([Pergunta]) --> Guardrail[guardrail_router_node]
