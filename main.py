@@ -1,9 +1,10 @@
 import json
+import sys
 import asyncio
 from fastapi import FastAPI
 from fastapi import Request
 import uuid
-from app.application.rag_workflow.graph import nurseask_engine as rag_app
+from app.application.rag_workflow.graph import nurseask_engine 
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,20 +14,45 @@ from langchain_core.messages import HumanMessage
 from contextlib import asynccontextmanager
 from app.application.rag_workflow.graph import checkpointer
 
-# Importa o motor real que criamos com o LangGraph
 from app.application.rag_workflow.graph import nurseask_engine
 
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     # Executado na INICIALIZAÇÃO do servidor
+#     print("🔄 [REDIS] Criando índices do RediSearch...")
+#     await checkpointer.setup()
+#     print("✅ [REDIS] Índices prontos!")
+    
+#     yield  # A aplicação roda enquanto estiver neste ponto
+    
+#     # Executado no DESLIGAMENTO do servidor (se precisar fechar conexões)
+#     print("🛑 [SERVER] Encerrando aplicação...")
+
+# app = FastAPI(lifespan=lifespan)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Executado na INICIALIZAÇÃO do servidor
+    # 1. Mantém a configuração original do Redis
     print("🔄 [REDIS] Criando índices do RediSearch...")
     await checkpointer.setup()
     print("✅ [REDIS] Índices prontos!")
-    
-    yield  # A aplicação roda enquanto estiver neste ponto
-    
-    # Executado no DESLIGAMENTO do servidor (se precisar fechar conexões)
+
+    # 2. Executa o seu script de ingestão automaticamente na subida
+    print("📥 [INGESTÃO] Verificando e indexando protocolos da pasta data/...")
+    processo = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "app/scripts/ingest_data", 
+    )
+    codigo_retorno = await processo.wait()
+
+    if codigo_retorno == 0:
+        print("✅ [INGESTÃO] Protocolos prontos no Elasticsearch!")
+    else:
+        print(f"⚠️ [INGESTÃO] Falha ao executar ingestão (código {codigo_retorno}).")
+
+    yield
+
     print("🛑 [SERVER] Encerrando aplicação...")
+    
 
 
 app = FastAPI(

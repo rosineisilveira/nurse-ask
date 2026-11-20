@@ -4,9 +4,15 @@ import re
 import warnings
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+# BASE_DIR = Path(__file__).resolve().parent.parent
+# if str(BASE_DIR) not in sys.path:
+#     sys.path.insert(0, str(BASE_DIR))
+from pathlib import Path
+
+DATA_DIR = Path("data")
+
+def get_pdf_files() -> list[Path]:
+    return sorted(DATA_DIR.glob("*.pdf"))
 
 import pymupdf
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,16 +23,16 @@ from database.elastic_motor import ElasticMotor
 warnings.filterwarnings("ignore")
 
 
-def obter_caminho_pdf(nome_arquivo: str = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf") -> Path:
-    caminho_local = BASE_DIR / nome_arquivo
-    if caminho_local.exists():
-        return caminho_local
+# def obter_caminho_pdf(nome_arquivo: str = "Manual-de-Procedimentos-Básicos-de-Enfermagem.pdf") -> Path:
+#     caminho_local = DATA_DIR / nome_arquivo
+#     if caminho_local.exists():
+#         return caminho_local
 
-    caminho_downloads = Path.home() / "Downloads" / nome_arquivo
-    if caminho_downloads.exists():
-        return caminho_downloads
+#     caminho_downloads = Path.home() / "Downloads" / nome_arquivo
+#     if caminho_downloads.exists():
+#         return caminho_downloads
 
-    raise FileNotFoundError(f"❌ O PDF '{nome_arquivo}' não foi encontrado.")
+#     raise FileNotFoundError(f"❌ O PDF '{nome_arquivo}' não foi encontrado.")
 
 
 def limpar_caracteres_pua(texto: str) -> str:
@@ -55,7 +61,7 @@ def extrair_fluxo_continuo_pdf(doc: pymupdf.Document) -> str:
 
 
 def executar_ingestao_parent_child_continuo(tamanho_lote: int = 50):
-    caminho_pdf = obter_caminho_pdf()
+    caminho_pdf = DATA_DIR
     print(f"📄 [INGESTÃO CONTINUA CROSS-PAGE] Lendo PDF: {caminho_pdf.name}")
 
     doc = pymupdf.open(str(caminho_pdf))

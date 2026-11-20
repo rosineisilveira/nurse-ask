@@ -7,7 +7,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app
+      - ./data:/app/data
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/nurseask
       - QDRANT_URL=http://qdrant:6333
@@ -18,7 +18,8 @@ services:
     depends_on:
       - postgres
       - qdrant
-      - elasticsearch
+      - elasticsearch:
+          condition: service_healthy
       - neo4j
 
   # 2. Vector DB (Qdrant)
