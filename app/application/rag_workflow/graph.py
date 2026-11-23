@@ -5,7 +5,6 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from app.application.rag_workflow.state import RAGState
 from app.application.rag_workflow.schemas import RouteTarget
-
 from app.application.rag_workflow.state import RAGState
 from app.application.rag_workflow.nodes import (
     rewrite_node,
@@ -20,10 +19,8 @@ from app.application.rag_workflow.nodes import (
     
 )
 
-## 1. Conexão com o Redis Checkpointer
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 checkpointer = AsyncRedisSaver(redis_url=REDIS_URL)
-
    
 def decide_to_generate(state: RAGState) -> str:
     valid = state.get("context_valid", False)
@@ -55,25 +52,18 @@ builder.add_node("summarize", summarize_node)
 builder.add_node("guardrail_router", guardrail_router_node)
 builder.add_node("fallback", fallback_node)
 
-# 4. Definição do Fluxo e Arestas
-
-# Entrada: Resolve anáforas do chat usando histórico do Redis antes da busca
 builder.add_edge(START, "guardrail_router")
 
 builder.add_conditional_edges(
     "guardrail_router",
     route_after_guardrail,
     {
-        # Se for seguro (RouteTarget.RETRIEVER), mapeamos para o condense_question 
-        # para preservar seu fluxo original de tratamento de histórico
         RouteTarget.RETRIEVER.value: "condense_question",
         
-        # Se for bloqueado, vai para o fallback
         RouteTarget.FALLBACK.value: "fallback"
     }
 )
 
-# [NOVO] Encerra o fluxo se cair no fallback
 builder.add_edge("fallback", END)
 
 builder.add_edge("condense_question", "retriever")
@@ -97,7 +87,6 @@ builder.add_edge("rewrite", "retriever")
 builder.add_edge("generate", "summarize")
 builder.add_edge("summarize", END)
 
-# 5. Compilação com Checkpointer Nativo no Redis
 nurseask_engine = builder.compile(checkpointer=checkpointer)
 
 

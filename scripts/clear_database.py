@@ -1,39 +1,46 @@
+import asyncio
 import os
 import sys
+from pathlib import Path
 
-# Ajusta a rota para enxergar a raiz do projeto
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Adjusts sys.path to resolve project root imports
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from database.elastic_motor import ElasticMotor
+try:
+    from dotenv import load_dotenv
 
-def limpar_banco():
-    print("\n" + "="*50)
+    load_dotenv()
+except ImportError:
+    pass
+
+from elasticsearch import AsyncElasticsearch
+
+INDEX_NAME = "protocolos_enfermagem"
+
+
+async def clear_database(index_name: str = INDEX_NAME) -> None:
+    print("\n" + "=" * 50)
     print("🧹 INICIANDO LIMPEZA TOTAL DO ELASTICSEARCH")
-    print("="*50)
-    
-    db = ElasticMotor()
-    cliente_es = db.store.client
-    
-    # Busca a variável privada '_index_name'. Se não achar, usa o padrão 'langchain'
-    nome_indice = getattr(db.store, "_index_name", "langchain")
-    
-    # 💡 DICA: Se no seu arquivo elastic_motor.py você digitou algo como 
-    # index_name="protocolos", você pode apagar a linha acima e forçar o nome aqui:
-    # nome_indice = "protocolos"
-    
+    print("=" * 50)
+
+    elastic_url = os.getenv("ELASTIC_URL", "http://localhost:9200")
+    es_client = AsyncElasticsearch(elastic_url)
+
     try:
-        print(f"🗑️ Deletando o índice: '{nome_indice}'...")
-        
-        # O parâmetro ignore_unavailable evita erros se o banco já estiver vazio
-        cliente_es.indices.delete(index=nome_indice, ignore_unavailable=True)
-        
-        print(f"[✅ SUCESSO] Banco de dados limpo e zerado!")
-        print("[INFO] Um novo índice vazio será criado na próxima ingestão.")
-        
-    except Exception as e:
-        print(f"[❌ ERRO] Não foi possível limpar o banco: {e}")
-        
-    print("="*50 + "\n")
+        if await es_client.indices.exists(index=index_name):
+            print(f"🗑️ Deletando o índice: '{index_name}'...")
+            await es_client.indices.delete(index=index_name)
+            print("✅ [SUCESSO] Banco de dados limpo e zerado!")
+            print("ℹ️ [INFO] Um novo índice vazio será criado na próxima ingestão.")
+        else:
+            print(f"ℹ️ [INFO] O índice '{index_name}' não existe ou já está vazio.")
+    except Exception as err:
+        print(f"❌ [ERRO] Não foi possível limpar o banco: {err}")
+    finally:
+        await es_client.close()
+
+    print("=" * 50 + "\n")
+
 
 if __name__ == "__main__":
-    limpar_banco()
+    asyncio.run(clear_database())

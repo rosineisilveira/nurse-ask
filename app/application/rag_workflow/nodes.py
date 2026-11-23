@@ -5,14 +5,12 @@ import os
 import re
 import sys
 from pathlib import Path
-
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_ollama import ChatOllama
 from sentence_transformers import CrossEncoder
-
 from app.application.rag_workflow.schemas import (
     EvaluationDecision,
     GuardrailDecision,
@@ -43,7 +41,6 @@ llm_rewrite = ChatOllama(model="llama3.1", temperature=0.4, num_predict=100, rep
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 motor = ElasticMotor(index_name="protocolos_enfermagem", reranker=reranker)
-
 
 async def guardrail_router_node(state: RAGState) -> RAGState:
     question = state.get("question", "").strip()
@@ -258,11 +255,11 @@ PERGUNTA:
         }
         
 async def rewrite_node(state: RAGState) -> RAGState:
-    pergunta_usuario = state.get("question", "")
-    consulta_anterior = state.get("standalone_question") or pergunta_usuario
-    proxima_tentativa = state.get("retry_count", 0) + 1
+    user_question = state.get("question", "")
+    previous_question = state.get("standalone_question") or user_question
+    next_question = state.get("retry_count", 0) + 1
 
-    logger.info(f"🔄 [NODE] Rewriter iniciado (Tentativa {proxima_tentativa}/3)...")
+    logger.info(f"🔄 [NODE] Rewriter iniciado (Tentativa {next_question}/3)...")
 
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -279,38 +276,38 @@ Responda APENAS usando o formato JSON exigido.""",
         (
             "human",
             "Pergunta original (NÃO MUDE O ASSUNTO): '{original}'\n"
-            "Consulta anterior que falhou: '{anterior}'\n"
-            "Tentativa atual: #{tentativa}",
+            "Consulta anterior que falhou: '{previous}'\n"
+            "Tentativa atual: #{attempt}",
         ),
     ])    
 
     try:
         structured_rewriter = llm_rewrite.with_structured_output(RewriteDecision, method="json_schema")
         decision = await (prompt | structured_rewriter).ainvoke({
-            "original": pergunta_usuario,
-            "anterior": consulta_anterior,
-            "tentativa": proxima_tentativa,
+            "original": user_question,
+            "previous": previous_question,
+            "attempt": next_question,
         })
-        nova_consulta = decision.standalone_question.strip()
+        new_query = decision.standalone_question.strip()
 
     except Exception as e:
         logger.warning(f"⚠️ [REWRITER] Fallback textual acionado: {e}")
         resposta = await llm_rewrite.ainvoke(
             prompt.format_messages(
-                original=pergunta_usuario,
-                anterior=consulta_anterior,
-                tentativa=proxima_tentativa,
+                original=user_question,
+                anterior=previous_question,
+                tentativa=next_question,
             )
         )
-        nova_consulta = str(resposta.content).replace("assistant", "").strip()
+        new_query = str(resposta.content).replace("assistant", "").strip()
 
-    logger.info(f"📝 [REWRITER] Nova consulta (#{proxima_tentativa}): '{nova_consulta}'")
+    logger.info(f"📝 [REWRITER] Nova consulta (#{next_question}): '{new_query}'")
 
     return {
-        "standalone_question": nova_consulta,
+        "standalone_question": new_query,
         "documents": [],
         "top_score": None,
-        "retry_count": proxima_tentativa,
+        "retry_count": next_question,
     }
 
 async def condense_question_node(state: RAGState) -> RAGState:
@@ -364,22 +361,21 @@ async def summarize_node(state: RAGState, max_messages: int = 6) -> RAGState:
 
     logger.info(f"🧹 [NODE] Limiar de mensagens atingido ({len(messages)}). Gerando resumo...")
 
-    summary_atual = state.get("summary", "")
-    mensagens_para_resumir = messages[:-2]
+    current_summary = state.get("summary", "")
+    messages_to_summary = messages[:-2]
 
-    texto_mensagens = "\n".join(
+    text_messages = "\n".join(
         f"{'Enfermeiro' if isinstance(msg, HumanMessage) else 'Assistente'}: {msg.content}"
-        for msg in mensagens_para_resumir
-    )
+        for msg in messages_to_summary)
 
     prompt_sumarizacao = f"""Você é um sistema de memória clínica para um assistente de enfermagem.
 Sua missão é atualizar o resumo da conversa mantendo OBRIGATORIAMENTE todos os detalhes técnicos relevantes.
 
 Resumo Anterior:
-{summary_atual if summary_atual else "Início da conversa."}
+{current_summary if current_summary else "Início da conversa."}
 
 Novas Mensagens a Condensar:
-{texto_mensagens}
+{text_messages}
 
 Regras Estritas de Preservação:
 1. MANTENHA TODOS os nomes de procedimentos (ex: Posição de Sims, DDH), calibres de sondas, dosagens, materiais, vias de administração e sinais vitais citados.
@@ -389,17 +385,17 @@ Regras Estritas de Preservação:
 Novo Resumo Clínico:"""
 
     try:
-        resposta = await llm_decision.ainvoke([SystemMessage(content=prompt_sumarizacao)])
-        novo_resumo = str(resposta.content).strip()
-        mensagens_removidas = [
+        response = await llm_decision.ainvoke([SystemMessage(content=prompt_sumarizacao)])
+        new_summary = str(response.content).strip()
+        deleted_messages = [
             RemoveMessage(id=m.id)
-            for m in mensagens_para_resumir
+            for m in messages_to_summary
             if hasattr(m, "id") and m.id
         ]
-        logger.info(f"✅ [NODE] Resumo atualizado ({len(novo_resumo)} chars).")
+        logger.info(f"✅ [NODE] Resumo atualizado ({len(new_summary)} chars).")
         return {
-            "summary": novo_resumo,
-            "messages": mensagens_removidas,
+            "summary": new_summary,
+            "messages": deleted_messages,
         }
     except Exception as e:
         logger.error(f"❌ [NODE] Erro no summarize_node: {e}", exc_info=True)
@@ -473,7 +469,7 @@ async def evaluator_node(state: RAGState) -> RAGState:
         )
         return {"context_valid": True}
 
-    # Zona cinzenta ou score baixo (< 1.0): aciona o LLM apenas para filtrar ruído
+    # Zona cinzenta ou score baixo (< 3.0): aciona o LLM apenas para filtrar ruído
     context_blocks: list[str] = []
     for doc in docs:
         content = doc.get("content", "").strip()
